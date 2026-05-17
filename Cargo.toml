@@ -9,6 +9,7 @@ arti-client = { version = "0.42", default-features = false, features = ["tokio",
 crossterm = { version = "0.28", features = ["event-stream"] }
 directories = "5"
 futures = "0.3"
+libsqlite3-sys = { version = "0.37", features = ["bundled"] }
 mdns-sd = "0.11"
 rand = "0.8"
 ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
