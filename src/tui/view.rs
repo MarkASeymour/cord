@@ -8,7 +8,7 @@ use super::{layout, App, ChatEntry, TransportState};
 const SHORT_ONION: usize = 16;
 
 pub fn render(frame: &mut Frame, app: &App) {
-    let (status, chat, input) = layout::split(frame.area());
+    let (status, chat, input, footer) = layout::split(frame.area());
 
     let status_line = Line::from(vec![
         Span::styled("cord ", Style::default().add_modifier(Modifier::BOLD)),
@@ -35,8 +35,24 @@ pub fn render(frame: &mut Frame, app: &App) {
         chat,
     );
 
-    let input_line = Line::from(vec![Span::raw("> "), Span::raw(&app.input_buffer)]);
+    let input_line = if app.input_buffer.is_empty() {
+        Line::from(vec![
+            Span::raw("> "),
+            Span::styled(
+                "type /help for commands",
+                Style::default().add_modifier(Modifier::DIM),
+            ),
+        ])
+    } else {
+        Line::from(vec![Span::raw("> "), Span::raw(&app.input_buffer)])
+    };
     frame.render_widget(Paragraph::new(input_line), input);
+
+    let footer_line = Line::from(Span::styled(
+        "Esc quit  ·  Enter send  ·  /help commands  ·  /quit exit",
+        Style::default().add_modifier(Modifier::DIM),
+    ));
+    frame.render_widget(Paragraph::new(footer_line), footer);
 
     let cursor_x = input.x + 2 + app.input_buffer.chars().count() as u16;
     frame.set_cursor_position((cursor_x.min(input.x + input.width.saturating_sub(1)), input.y));

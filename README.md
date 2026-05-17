@@ -32,7 +32,19 @@ To run two instances side by side for local testing, give each its own config di
 4. arti bootstraps Tor. Takes 10 to 30 seconds on a cold start.
 5. The TUI status line shows your `.onion` address. Same address every run.
 
-Esc or Ctrl C to quit.
+## Using the TUI
+
+The screen has four regions: a status bar, the chat log, your input line, and a key hint footer.
+
+Type `/help` and press Enter to list every command. Quick reference:
+
+- `/help` show commands
+- `/connect <address>` dial a peer over Tor (debug only, goes away when pairing lands)
+- `/quit` exit
+- Esc or Ctrl C exit
+- Enter submit
+
+Typed text without a leading slash echoes back. Messaging is not implemented yet.
 
 ## Tests
 

@@ -19,6 +19,10 @@ struct Args {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> ExitCode {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("install rustls ring crypto provider");
+
     let args: Args = argh::from_env();
     match run(args).await {
         Ok(()) => ExitCode::SUCCESS,

@@ -3,7 +3,7 @@ use std::io::{self, Stdout};
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use crossterm::event::{DisableMouseCapture, EnableMouseCapture, EventStream};
+use crossterm::event::EventStream;
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -53,7 +53,7 @@ pub enum ChatEntry {
 impl App {
     pub fn new(identity: Identity) -> Self {
         let mut chat_log = VecDeque::with_capacity(CHAT_LOG_CAP);
-        chat_log.push_back(ChatEntry::System("cord starting…".to_string()));
+        chat_log.push_back(ChatEntry::System("welcome to cord".to_string()));
         if identity.freshly_generated {
             chat_log.push_back(ChatEntry::System(format!(
                 "identity generated at {}",
@@ -69,6 +69,9 @@ impl App {
                 identity.config_dir.display()
             )));
         }
+        chat_log.push_back(ChatEntry::System(
+            "ready. type /help for commands. Esc to quit.".to_string(),
+        ));
         Self {
             identity,
             transport_state: TransportState::Bootstrapping,
@@ -194,7 +197,7 @@ async fn run_loop(
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>, CordError> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     Ok(Terminal::new(backend)?)
 }
@@ -203,11 +206,7 @@ fn restore_terminal(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
 ) -> Result<(), CordError> {
     disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     Ok(())
 }
