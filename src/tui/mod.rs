@@ -14,6 +14,7 @@ use ratatui::Terminal;
 use tokio::sync::mpsc;
 use tokio::time::interval;
 
+use crate::contacts::{self, Contact, ContactBlob, ContactStatus};
 use crate::discovery::KnownPeer;
 use crate::errors::CordError;
 use crate::identity::{Identity, PeerId};
@@ -29,6 +30,7 @@ pub struct App {
     pub identity: Identity,
     pub transport_state: TransportState,
     pub peers: HashMap<PeerId, KnownPeer>,
+    pub contacts: Vec<Contact>,
     pub chat_log: VecDeque<ChatEntry>,
     pub input_buffer: String,
     pub should_quit: bool,
@@ -41,6 +43,7 @@ pub enum TransportState {
     },
     Onion {
         onion_name: String,
+        hs_id: [u8; 32],
         lan: Option<SocketAddr>,
     },
     Failed(String),
@@ -69,6 +72,23 @@ impl App {
                 identity.config_dir.display()
             )));
         }
+
+        let contacts = match contacts::load(&identity.config_dir) {
+            Ok(list) => {
+                if !list.is_empty() {
+                    chat_log.push_back(ChatEntry::System(format!(
+                        "loaded {} contact(s) from disk",
+                        list.len()
+                    )));
+                }
+                list
+            }
+            Err(e) => {
+                chat_log.push_back(ChatEntry::System(format!("contacts: load failed: {e}")));
+                Vec::new()
+            }
+        };
+
         chat_log.push_back(ChatEntry::System(
             "ready. type /help for commands. Esc to quit.".to_string(),
         ));
@@ -76,10 +96,127 @@ impl App {
             identity,
             transport_state: TransportState::Bootstrapping,
             peers: HashMap::new(),
+            contacts,
             chat_log,
             input_buffer: String::new(),
             should_quit: false,
         }
+    }
+
+    pub fn pair_with(&mut self, blob_text: &str) {
+        let blob = match ContactBlob::decode(blob_text) {
+            Ok(b) => b,
+            Err(e) => {
+                self.push_system(format!("/pair: {e}"));
+                return;
+            }
+        };
+        if let Some(existing) = self
+            .contacts
+            .iter()
+            .find(|c| c.blob.noise_static_pub == blob.noise_static_pub)
+        {
+            self.push_system(format!(
+                "already paired with {} ({})",
+                existing.short_label(),
+                existing.status.label()
+            ));
+            return;
+        }
+        let label = blob.display_name.clone().unwrap_or_else(|| "(no name)".into());
+        self.contacts.push(Contact {
+            blob,
+            status: ContactStatus::Pending,
+        });
+        if let Err(e) = contacts::save(&self.identity.config_dir, &self.contacts) {
+            self.push_system(format!("contacts: save failed: {e}"));
+        }
+        self.push_system(format!("added pending contact: {label}"));
+    }
+
+    pub fn verify_contact(&mut self, query: &str) {
+        self.transition_contact(query, ContactStatus::Verified, "verified", true);
+    }
+
+    pub fn reject_contact(&mut self, query: &str) {
+        self.transition_contact(query, ContactStatus::Rejected, "rejected", false);
+    }
+
+    fn transition_contact(
+        &mut self,
+        query: &str,
+        target: ContactStatus,
+        verb: &str,
+        require_pending: bool,
+    ) {
+        let matches: Vec<usize> = self
+            .contacts
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.matches_query(query))
+            .map(|(i, _)| i)
+            .collect();
+        match matches.as_slice() {
+            [] => self.push_system(format!("no contact matches {query:?}")),
+            [i] => {
+                let i = *i;
+                let current = self.contacts[i].status;
+                if require_pending && current != ContactStatus::Pending {
+                    let label = self.contacts[i].short_label();
+                    self.push_system(format!(
+                        "{label} is already {} (not pending)",
+                        current.label()
+                    ));
+                    return;
+                }
+                self.contacts[i].status = target;
+                let label = self.contacts[i].short_label();
+                if let Err(e) = contacts::save(&self.identity.config_dir, &self.contacts) {
+                    self.push_system(format!("contacts: save failed: {e}"));
+                }
+                self.push_system(format!("{verb} contact: {label}"));
+            }
+            _ => self.push_system(format!(
+                "multiple contacts match {query:?}. use a more specific name or longer hex prefix."
+            )),
+        }
+    }
+
+    pub fn list_contacts(&mut self) {
+        if self.contacts.is_empty() {
+            self.push_system("no contacts yet. use /pair <blob> to add one.");
+            return;
+        }
+        self.push_system(format!("contacts ({}):", self.contacts.len()));
+        let lines: Vec<String> = self
+            .contacts
+            .iter()
+            .map(|c| format!("  {}", c))
+            .collect();
+        for line in lines {
+            self.push_system(line);
+        }
+    }
+
+    pub fn share_blob(&mut self, display_name: Option<String>) {
+        let TransportState::Onion { hs_id, .. } = &self.transport_state else {
+            self.push_system("/share: wait for Tor bootstrap to finish first.");
+            return;
+        };
+        let noise_pub: [u8; 32] = match self.identity.noise_static.as_bytes().try_into() {
+            Ok(arr) => arr,
+            Err(_) => {
+                self.push_system("/share: noise key has wrong length (internal bug).");
+                return;
+            }
+        };
+        let blob = ContactBlob {
+            noise_static_pub: noise_pub,
+            hs_id: *hs_id,
+            display_name,
+        };
+        self.push_system("share this with your peer:");
+        self.push_system(blob.encode());
     }
 
     pub fn push_system(&mut self, line: impl Into<String>) {
@@ -97,15 +234,18 @@ impl App {
                     &mut self.transport_state,
                     TransportState::Bootstrapping,
                 ) {
-                    TransportState::Onion { onion_name, .. } => TransportState::Onion {
+                    TransportState::Onion {
+                        onion_name, hs_id, ..
+                    } => TransportState::Onion {
                         onion_name,
+                        hs_id,
                         lan: Some(lan),
                     },
                     _ => TransportState::Lan { listening_on: lan },
                 };
                 self.push_system(format!("lan listening on {lan}"));
             }
-            AppMsg::OnionReady { onion_name } => {
+            AppMsg::OnionReady { onion_name, hs_id } => {
                 let lan = match &self.transport_state {
                     TransportState::Lan { listening_on } => Some(*listening_on),
                     TransportState::Onion { lan, .. } => *lan,
@@ -114,6 +254,7 @@ impl App {
                 self.push_system(format!("onion ready: {onion_name}"));
                 self.transport_state = TransportState::Onion {
                     onion_name,
+                    hs_id,
                     lan,
                 };
             }
@@ -130,12 +271,41 @@ impl App {
                     self.push_system(format!("lost {}", peer_id.short()));
                 }
             }
-            AppMsg::HandshakeOk { peer_id, role } => {
+            AppMsg::HandshakeOk { peer_id, role, sas, remote_static } => {
                 self.push_system(format!(
                     "handshake ok ({}): {}",
                     role.label(),
                     peer_id.short()
                 ));
+                let matched: Option<(String, ContactStatus)> = self
+                    .contacts
+                    .iter()
+                    .find(|c| c.blob.noise_static_pub == remote_static)
+                    .map(|c| (c.short_label(), c.status));
+                match matched {
+                    Some((label, ContactStatus::Pending)) => {
+                        self.push_system(format!("matches pending contact: {label}"));
+                        self.push_system(format!(
+                            "sas: {sas} (compare aloud, then /verify {label} or /reject {label})"
+                        ));
+                    }
+                    Some((label, ContactStatus::Verified)) => {
+                        self.push_system(format!("matches verified contact: {label}"));
+                        self.push_system(format!("sas: {sas} (already verified)"));
+                    }
+                    Some((label, ContactStatus::Rejected)) => {
+                        self.push_system(format!(
+                            "matches rejected contact: {label}. dropping is recommended."
+                        ));
+                        self.push_system(format!("sas: {sas}"));
+                    }
+                    None => {
+                        self.push_system(
+                            "unpaired peer (no matching contact). /pair them first if you trust this connection.".to_string(),
+                        );
+                        self.push_system(format!("sas: {sas}"));
+                    }
+                }
             }
             AppMsg::HandshakeFailed { peer_id, role, error } => {
                 let who = peer_id

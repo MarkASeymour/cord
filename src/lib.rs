@@ -1,3 +1,4 @@
+pub mod contacts;
 pub mod discovery;
 pub mod errors;
 pub mod identity;

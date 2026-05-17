@@ -15,7 +15,7 @@ use tor_rtcompat::PreferredRuntime;
 
 use crate::discovery::{mdns, PeerEvent};
 use crate::errors::CordError;
-use crate::identity::PeerId;
+use crate::identity::{Identity, PeerId};
 use crate::noise::{self, StaticKey};
 use crate::transport::lan::LanTransport;
 use crate::transport::onion::{self, OnionLaunch};
@@ -31,18 +31,16 @@ pub struct TransportTask {
 }
 
 pub async fn spawn(
-    peer_id: PeerId,
-    config_dir: PathBuf,
+    identity: &Identity,
     msg_tx: mpsc::Sender<AppMsg>,
     mut cmd_rx: mpsc::Receiver<TransportCmd>,
 ) -> Result<TransportTask, CordError> {
+    let peer_id = identity.peer_id;
+    let config_dir = identity.config_dir.clone();
+    let static_key = identity.noise_static.clone();
+
     let lan = LanTransport::bind().await?;
     let local = lan.local_addr()?;
-    let static_key = Arc::new(StaticKey::generate().map_err(|e| {
-        CordError::Transport(crate::transport::TransportError::Io(std::io::Error::other(
-            e.to_string(),
-        )))
-    })?);
 
     let (peer_event_tx, peer_event_rx) = mpsc::channel(64);
     let mdns_handle = mdns::start(peer_id, local.port(), peer_event_tx)?;
@@ -175,6 +173,7 @@ fn spawn_onion(
         };
         let OnionLaunch {
             onion_name,
+            hs_id_bytes,
             service,
             tor_client,
             rend_requests,
@@ -183,6 +182,7 @@ fn spawn_onion(
         let _ = msg_tx
             .send(AppMsg::OnionReady {
                 onion_name: onion_name.clone(),
+                hs_id: hs_id_bytes,
             })
             .await;
 
@@ -226,14 +226,19 @@ async fn handshake_as_initiator_tcp(
         let mut stream = noise::handshake_initiator(sock, &static_key).await?;
         stream.send(own_id.as_bytes()).await?;
         let bytes = stream.recv().await?;
-        decode_peer_id(&bytes)
+        let other = decode_peer_id(&bytes)?;
+        let sas = noise::derive_sas(stream.handshake_hash());
+        let remote_static = capture_remote_static(&stream)?;
+        Ok::<(PeerId, String, [u8; 32]), noise::NoiseError>((other, sas, remote_static))
     }
     .await;
 
     let msg = match result {
-        Ok(reported) => AppMsg::HandshakeOk {
+        Ok((reported, sas, remote_static)) => AppMsg::HandshakeOk {
             peer_id: reported,
             role: Role::Initiator,
+            sas,
+            remote_static,
         },
         Err(e) => AppMsg::HandshakeFailed {
             peer_id: Some(expected_peer_id),
@@ -255,14 +260,18 @@ async fn handshake_as_responder_tcp(
         let bytes = stream.recv().await?;
         let other = decode_peer_id(&bytes)?;
         stream.send(own_id.as_bytes()).await?;
-        Ok::<PeerId, noise::NoiseError>(other)
+        let sas = noise::derive_sas(stream.handshake_hash());
+        let remote_static = capture_remote_static(&stream)?;
+        Ok::<(PeerId, String, [u8; 32]), noise::NoiseError>((other, sas, remote_static))
     }
     .await;
 
     let msg = match result {
-        Ok(other) => AppMsg::HandshakeOk {
+        Ok((other, sas, remote_static)) => AppMsg::HandshakeOk {
             peer_id: other,
             role: Role::Responder,
+            sas,
+            remote_static,
         },
         Err(e) => AppMsg::HandshakeFailed {
             peer_id: None,
@@ -294,14 +303,18 @@ async fn accept_onion_stream(
         let bytes = stream.recv().await?;
         let other = decode_peer_id(&bytes)?;
         stream.send(own_id.as_bytes()).await?;
-        Ok::<PeerId, noise::NoiseError>(other)
+        let sas = noise::derive_sas(stream.handshake_hash());
+        let remote_static = capture_remote_static(&stream)?;
+        Ok::<(PeerId, String, [u8; 32]), noise::NoiseError>((other, sas, remote_static))
     }
     .await;
 
     let msg = match result {
-        Ok(other) => AppMsg::HandshakeOk {
+        Ok((other, sas, remote_static)) => AppMsg::HandshakeOk {
             peer_id: other,
             role: Role::Responder,
+            sas,
+            remote_static,
         },
         Err(e) => AppMsg::HandshakeFailed {
             peer_id: None,
@@ -332,14 +345,19 @@ async fn connect_onion_peer(
         let mut stream = noise::handshake_initiator(compat, &static_key).await?;
         stream.send(own_id.as_bytes()).await?;
         let bytes = stream.recv().await?;
-        decode_peer_id(&bytes)
+        let other = decode_peer_id(&bytes)?;
+        let sas = noise::derive_sas(stream.handshake_hash());
+        let remote_static = capture_remote_static(&stream)?;
+        Ok::<(PeerId, String, [u8; 32]), noise::NoiseError>((other, sas, remote_static))
     }
     .await;
 
     let msg = match result {
-        Ok(other) => AppMsg::HandshakeOk {
+        Ok((other, sas, remote_static)) => AppMsg::HandshakeOk {
             peer_id: other,
             role: Role::Initiator,
+            sas,
+            remote_static,
         },
         Err(e) => AppMsg::HandshakeFailed {
             peer_id: None,
@@ -348,6 +366,21 @@ async fn connect_onion_peer(
         },
     };
     let _ = msg_tx.send(msg).await;
+}
+
+fn capture_remote_static<S>(stream: &noise::NoiseStream<S>) -> Result<[u8; 32], noise::NoiseError> {
+    let bytes = stream
+        .remote_static()
+        .ok_or_else(|| noise::NoiseError::BadPayload("no remote static after handshake".into()))?;
+    if bytes.len() != 32 {
+        return Err(noise::NoiseError::BadPayload(format!(
+            "remote static length {} not 32",
+            bytes.len()
+        )));
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(bytes);
+    Ok(out)
 }
 
 fn decode_peer_id(bytes: &[u8]) -> Result<PeerId, noise::NoiseError> {

@@ -4,11 +4,14 @@ use snow::Builder;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use zeroize::Zeroize;
 
+pub mod sas;
 pub mod stream;
 
+pub use sas::derive as derive_sas;
 pub use stream::NoiseStream;
 
 pub const NOISE_PATTERN: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
+pub const NOISE_STATIC_LEN: usize = 32;
 const MAX_MSG: usize = 65535;
 
 #[derive(Clone)]
@@ -27,6 +30,16 @@ impl StaticKey {
         Ok(Self {
             bytes: keypair.private,
         })
+    }
+
+    pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, NoiseError> {
+        if bytes.len() != NOISE_STATIC_LEN {
+            return Err(NoiseError::BadPayload(format!(
+                "noise static key must be {NOISE_STATIC_LEN} bytes, got {}",
+                bytes.len()
+            )));
+        }
+        Ok(Self { bytes })
     }
 
     pub fn as_bytes(&self) -> &[u8] {
@@ -119,8 +132,9 @@ where
     let n = state.write_message(&[], &mut buf)?;
     write_frame(&mut stream, &buf[..n]).await?;
 
+    let handshake_hash = state.get_handshake_hash().to_vec();
     let transport = state.into_transport_mode()?;
-    Ok(NoiseStream::new(stream, transport))
+    Ok(NoiseStream::new(stream, transport, handshake_hash))
 }
 
 pub async fn handshake_responder<S>(
@@ -149,8 +163,9 @@ where
     let msg = read_frame(&mut stream).await?;
     state.read_message(&msg, &mut buf)?;
 
+    let handshake_hash = state.get_handshake_hash().to_vec();
     let transport = state.into_transport_mode()?;
-    Ok(NoiseStream::new(stream, transport))
+    Ok(NoiseStream::new(stream, transport, handshake_hash))
 }
 
 pub(crate) async fn read_frame<R>(reader: &mut R) -> Result<Vec<u8>, NoiseError>

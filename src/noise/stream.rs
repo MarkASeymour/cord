@@ -8,16 +8,31 @@ const MAX_MSG: usize = 65535;
 pub struct NoiseStream<S> {
     transport: S,
     state: TransportState,
+    handshake_hash: Vec<u8>,
+}
+
+impl<S> NoiseStream<S> {
+    pub(super) fn new(transport: S, state: TransportState, handshake_hash: Vec<u8>) -> Self {
+        Self {
+            transport,
+            state,
+            handshake_hash,
+        }
+    }
+
+    pub fn remote_static(&self) -> Option<&[u8]> {
+        self.state.get_remote_static()
+    }
+
+    pub fn handshake_hash(&self) -> &[u8] {
+        &self.handshake_hash
+    }
 }
 
 impl<S> NoiseStream<S>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    pub(super) fn new(transport: S, state: TransportState) -> Self {
-        Self { transport, state }
-    }
-
     pub async fn send(&mut self, plaintext: &[u8]) -> Result<(), NoiseError> {
         let mut buf = vec![0u8; MAX_MSG];
         let n = self.state.write_message(plaintext, &mut buf)?;
@@ -30,9 +45,5 @@ where
         let n = self.state.read_message(&frame, &mut buf)?;
         buf.truncate(n);
         Ok(buf)
-    }
-
-    pub fn remote_static(&self) -> Option<&[u8]> {
-        self.state.get_remote_static()
     }
 }

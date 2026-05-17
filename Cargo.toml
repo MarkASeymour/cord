@@ -6,15 +6,18 @@ edition = "2021"
 [dependencies]
 argh = "0.1"
 arti-client = { version = "0.42", default-features = false, features = ["tokio", "rustls", "compression", "onion-service-service"] }
+base64 = "0.22"
 crossterm = { version = "0.28", features = ["event-stream"] }
 directories = "5"
 futures = "0.3"
+hkdf = "0.12"
 libsqlite3-sys = { version = "0.37", features = ["bundled"] }
 mdns-sd = "0.11"
 rand = "0.8"
 ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 safelog = "0.8"
+sha2 = "0.10"
 snow = { version = "0.10", default-features = false, features = ["use-curve25519", "use-chacha20poly1305", "use-blake2", "use-getrandom", "std"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util"] }
 tokio-util = { version = "0.7", features = ["compat"] }

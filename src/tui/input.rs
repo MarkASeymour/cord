@@ -48,6 +48,50 @@ fn submit(app: &mut App) -> Option<TransportCmd> {
         show_help(app);
         return None;
     }
+    if let Some(rest) = text.strip_prefix("/pair ") {
+        let trimmed = rest.trim();
+        if trimmed.is_empty() {
+            app.push_system("usage: /pair <blob>");
+            return None;
+        }
+        app.pair_with(trimmed);
+        return None;
+    }
+    if text == "/contacts" {
+        app.list_contacts();
+        return None;
+    }
+    if let Some(rest) = text.strip_prefix("/verify ") {
+        let q = rest.trim();
+        if q.is_empty() {
+            app.push_system("usage: /verify <name-or-hex>");
+            return None;
+        }
+        app.verify_contact(q);
+        return None;
+    }
+    if let Some(rest) = text.strip_prefix("/reject ") {
+        let q = rest.trim();
+        if q.is_empty() {
+            app.push_system("usage: /reject <name-or-hex>");
+            return None;
+        }
+        app.reject_contact(q);
+        return None;
+    }
+    if text == "/share" {
+        app.share_blob(None);
+        return None;
+    }
+    if let Some(rest) = text.strip_prefix("/share ") {
+        let name = rest.trim();
+        if name.is_empty() {
+            app.share_blob(None);
+        } else {
+            app.share_blob(Some(name.to_string()));
+        }
+        return None;
+    }
     if let Some(addr) = text.strip_prefix("/connect ") {
         let addr = addr.trim().to_string();
         if addr.is_empty() {
@@ -71,11 +115,16 @@ fn submit(app: &mut App) -> Option<TransportCmd> {
 
 fn show_help(app: &mut App) {
     app.push_system("commands:");
+    app.push_system("  /share [name]        print your own contact blob, optionally with a display name");
+    app.push_system("  /pair <blob>         add a peer's contact blob (status: pending)");
+    app.push_system("  /contacts            list paired contacts");
+    app.push_system("  /verify <name-or-hex>  upgrade a pending contact to verified (after comparing the SAS aloud)");
+    app.push_system("  /reject <name-or-hex>  mark a contact as rejected");
     app.push_system("  /connect <address>   dial a peer over Tor (debug only)");
     app.push_system("  /help, /?            show this");
     app.push_system("  /quit, /q            exit");
     app.push_system("keys:");
     app.push_system("  Esc, Ctrl-C          exit");
     app.push_system("  Enter                submit");
-    app.push_system("note: messaging is not implemented yet. typed text echoes back.");
+    app.push_system("note: messaging is not implemented yet.");
 }

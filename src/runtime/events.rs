@@ -6,12 +6,21 @@ use crate::identity::PeerId;
 pub enum AppMsg {
     Log(String),
     TransportReady(LocalAddrs),
-    OnionReady { onion_name: String },
+    OnionReady { onion_name: String, hs_id: [u8; 32] },
     OnionFailed(String),
     PeerDiscovered { peer_id: PeerId, addr: SocketAddr },
     PeerLost(PeerId),
-    HandshakeOk { peer_id: PeerId, role: Role },
-    HandshakeFailed { peer_id: Option<PeerId>, role: Role, error: String },
+    HandshakeOk {
+        peer_id: PeerId,
+        role: Role,
+        sas: String,
+        remote_static: [u8; 32],
+    },
+    HandshakeFailed {
+        peer_id: Option<PeerId>,
+        role: Role,
+        error: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]

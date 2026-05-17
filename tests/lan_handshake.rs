@@ -20,7 +20,8 @@ async fn two_lan_peers_handshake_over_tcp() {
         let mut id_bytes = [0u8; PeerId::BYTE_LEN];
         id_bytes.copy_from_slice(&bytes);
         stream.send(id_b.as_bytes()).await.unwrap();
-        PeerId::from_bytes(id_bytes)
+        let sas = noise::derive_sas(stream.handshake_hash());
+        (PeerId::from_bytes(id_bytes), sas)
     });
 
     let initiator = tokio::spawn(async move {
@@ -30,12 +31,17 @@ async fn two_lan_peers_handshake_over_tcp() {
         let bytes = stream.recv().await.unwrap();
         let mut id_bytes = [0u8; PeerId::BYTE_LEN];
         id_bytes.copy_from_slice(&bytes);
-        PeerId::from_bytes(id_bytes)
+        let sas = noise::derive_sas(stream.handshake_hash());
+        (PeerId::from_bytes(id_bytes), sas)
     });
 
-    let responder_saw = responder.await.unwrap();
-    let initiator_saw = initiator.await.unwrap();
+    let (responder_id, responder_sas) = responder.await.unwrap();
+    let (initiator_id, initiator_sas) = initiator.await.unwrap();
 
-    assert_eq!(responder_saw, id_a, "responder learned initiator peer-id");
-    assert_eq!(initiator_saw, id_b, "initiator learned responder peer-id");
+    assert_eq!(responder_id, id_a, "responder learned initiator peer-id");
+    assert_eq!(initiator_id, id_b, "initiator learned responder peer-id");
+    assert_eq!(
+        responder_sas, initiator_sas,
+        "both sides must derive the same SAS"
+    );
 }

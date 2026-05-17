@@ -14,6 +14,7 @@ pub type RendStream = Pin<Box<dyn Stream<Item = RendRequest> + Send>>;
 
 pub struct OnionLaunch {
     pub onion_name: String,
+    pub hs_id_bytes: [u8; 32],
     pub service: Arc<RunningOnionService>,
     pub tor_client: TorClient<PreferredRuntime>,
     pub rend_requests: RendStream,
@@ -44,9 +45,11 @@ pub async fn launch(_config_dir: PathBuf) -> Result<OnionLaunch, TransportError>
         .onion_address()
         .ok_or_else(|| TransportError::Onion("service has no onion address".into()))?;
     let onion_name = hs_id.display_unredacted().to_string();
+    let hs_id_bytes: [u8; 32] = *hs_id.as_ref();
 
     Ok(OnionLaunch {
         onion_name,
+        hs_id_bytes,
         service,
         tor_client,
         rend_requests: Box::pin(rend_requests),
