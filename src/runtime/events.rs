@@ -21,6 +21,15 @@ pub enum AppMsg {
         role: Role,
         error: String,
     },
+    MessageReceived {
+        from_peer_id: PeerId,
+        remote_static: [u8; 32],
+        text: String,
+    },
+    PeerDisconnected {
+        peer_id: PeerId,
+        remote_static: [u8; 32],
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -42,6 +51,7 @@ impl Role {
 pub enum TransportCmd {
     Shutdown,
     ConnectOnion(String),
+    SendMessage { remote_static: [u8; 32], text: String },
 }
 
 #[derive(Debug, Clone, Copy)]

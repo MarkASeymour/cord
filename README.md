@@ -43,12 +43,13 @@ Type `/help` and press Enter to list every command. Quick reference:
 - `/contacts` list paired contacts and their status.
 - `/verify <name-or-hex>` upgrade a pending contact to verified, after you have compared the SAS aloud.
 - `/reject <name-or-hex>` mark a contact as rejected.
+- `/msg <name> <text>` send a text message to a verified contact.
 - `/connect <address>` dial a peer over Tor (debug only).
 - `/quit` exit.
 - Esc or Ctrl C exit.
 - Enter submit.
 
-Typed text without a leading slash echoes back. Messaging is not implemented yet.
+Typed text without a leading slash echoes back locally. Use `/msg` to actually send.
 
 ## Pairing
 
@@ -63,6 +64,19 @@ To pair with someone:
 5. If the codes match on both ends, each user runs `/verify <name-or-hex>` to upgrade the contact to `verified`. If they do not match, run `/reject <name-or-hex>` and start over; you are being intercepted.
 
 Contacts persist at `<config_dir>/contacts` with 0600 file mode.
+
+## Messaging
+
+Once two cord users have paired and verified each other, the `/msg` command sends UTF-8 text over the open Noise channel.
+
+    /msg alice hey, this works
+
+Requirements:
+
+- The contact must be `Verified`. Pending and rejected contacts cannot receive messages.
+- A live connection must already exist. On LAN, that means the peer was auto discovered through mDNS and handshook. Over Tor, that means someone ran `/connect <address>` on at least one side. The recipient must be online at the moment you send. There is no message queue yet; sending to an offline peer fails immediately.
+
+Incoming messages appear in the chat log with the sender's name in bold. Outgoing messages echo back dimmed with a `you →` prefix. The full message history persists only in memory for the current session; no on disk history yet.
 
 ## Tests
 

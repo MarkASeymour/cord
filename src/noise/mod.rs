@@ -8,7 +8,7 @@ pub mod sas;
 pub mod stream;
 
 pub use sas::derive as derive_sas;
-pub use stream::NoiseStream;
+pub use stream::{NoiseReader, NoiseStream, NoiseWriter};
 
 pub const NOISE_PATTERN: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
 pub const NOISE_STATIC_LEN: usize = 32;

@@ -28,6 +28,20 @@ pub fn render(frame: &mut Frame, app: &App) {
                 format!("· {text}"),
                 Style::default().add_modifier(Modifier::DIM),
             )),
+            ChatEntry::Incoming { from, text } => Line::from(vec![
+                Span::styled(
+                    format!("{from}: "),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(text.clone()),
+            ]),
+            ChatEntry::Outgoing { to, text } => Line::from(vec![
+                Span::styled(
+                    format!("you → {to}: "),
+                    Style::default().add_modifier(Modifier::DIM),
+                ),
+                Span::raw(text.clone()),
+            ]),
         })
         .collect();
     frame.render_widget(

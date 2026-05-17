@@ -1,17 +1,26 @@
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use tokio::sync::mpsc;
 
 use crate::runtime::events::TransportCmd;
 
 use super::App;
 
-pub fn handle(app: &mut App, event: Event) -> Option<TransportCmd> {
+pub fn handle(
+    app: &mut App,
+    event: Event,
+    cmd_tx: &mpsc::Sender<TransportCmd>,
+) -> Option<TransportCmd> {
     match event {
-        Event::Key(key) if key.kind != KeyEventKind::Release => handle_key(app, key),
+        Event::Key(key) if key.kind != KeyEventKind::Release => handle_key(app, key, cmd_tx),
         _ => None,
     }
 }
 
-fn handle_key(app: &mut App, key: KeyEvent) -> Option<TransportCmd> {
+fn handle_key(
+    app: &mut App,
+    key: KeyEvent,
+    cmd_tx: &mpsc::Sender<TransportCmd>,
+) -> Option<TransportCmd> {
     if key.modifiers.contains(KeyModifiers::CONTROL)
         && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
     {
@@ -23,7 +32,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Option<TransportCmd> {
             app.should_quit = true;
             None
         }
-        KeyCode::Enter => submit(app),
+        KeyCode::Enter => submit(app, cmd_tx),
         KeyCode::Backspace => {
             app.input_buffer.pop();
             None
@@ -38,7 +47,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Option<TransportCmd> {
     }
 }
 
-fn submit(app: &mut App) -> Option<TransportCmd> {
+fn submit(app: &mut App, cmd_tx: &mpsc::Sender<TransportCmd>) -> Option<TransportCmd> {
     let text = app.input_buffer.trim().to_string();
     app.input_buffer.clear();
     if text.is_empty() {
@@ -46,6 +55,21 @@ fn submit(app: &mut App) -> Option<TransportCmd> {
     }
     if text == "/help" || text == "/?" {
         show_help(app);
+        return None;
+    }
+    if let Some(rest) = text.strip_prefix("/msg ") {
+        let trimmed = rest.trim();
+        match trimmed.split_once(char::is_whitespace) {
+            Some((name, body)) => {
+                let body = body.trim();
+                if body.is_empty() {
+                    app.push_system("usage: /msg <name> <text>");
+                } else {
+                    app.send_to_contact(name.trim(), body, cmd_tx);
+                }
+            }
+            None => app.push_system("usage: /msg <name> <text>"),
+        }
         return None;
     }
     if let Some(rest) = text.strip_prefix("/pair ") {
@@ -120,11 +144,12 @@ fn show_help(app: &mut App) {
     app.push_system("  /contacts            list paired contacts");
     app.push_system("  /verify <name-or-hex>  upgrade a pending contact to verified (after comparing the SAS aloud)");
     app.push_system("  /reject <name-or-hex>  mark a contact as rejected");
+    app.push_system("  /msg <name> <text>   send a text message to a verified contact");
     app.push_system("  /connect <address>   dial a peer over Tor (debug only)");
     app.push_system("  /help, /?            show this");
     app.push_system("  /quit, /q            exit");
     app.push_system("keys:");
     app.push_system("  Esc, Ctrl-C          exit");
     app.push_system("  Enter                submit");
-    app.push_system("note: messaging is not implemented yet.");
+    app.push_system("note: messaging requires both sides verified. there is no message queue yet; the recipient must be online.");
 }

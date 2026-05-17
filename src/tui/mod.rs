@@ -51,6 +51,8 @@ pub enum TransportState {
 
 pub enum ChatEntry {
     System(String),
+    Incoming { from: String, text: String },
+    Outgoing { to: String, text: String },
 }
 
 impl App {
@@ -220,10 +222,22 @@ impl App {
     }
 
     pub fn push_system(&mut self, line: impl Into<String>) {
+        self.push_entry(ChatEntry::System(line.into()));
+    }
+
+    pub fn push_incoming(&mut self, from: String, text: String) {
+        self.push_entry(ChatEntry::Incoming { from, text });
+    }
+
+    pub fn push_outgoing(&mut self, to: String, text: String) {
+        self.push_entry(ChatEntry::Outgoing { to, text });
+    }
+
+    fn push_entry(&mut self, entry: ChatEntry) {
         if self.chat_log.len() == CHAT_LOG_CAP {
             self.chat_log.pop_front();
         }
-        self.chat_log.push_back(ChatEntry::System(line.into()));
+        self.chat_log.push_back(entry);
     }
 
     pub fn apply(&mut self, msg: AppMsg) {
@@ -316,7 +330,75 @@ impl App {
                     role.label()
                 ));
             }
+            AppMsg::MessageReceived {
+                remote_static,
+                text,
+                ..
+            } => {
+                let from = self.label_for_remote(&remote_static);
+                self.push_incoming(from, text);
+            }
+            AppMsg::PeerDisconnected { remote_static, .. } => {
+                let who = self.label_for_remote(&remote_static);
+                self.push_system(format!("disconnected: {who}"));
+            }
         }
+    }
+
+    fn label_for_remote(&self, remote_static: &[u8; 32]) -> String {
+        self.contacts
+            .iter()
+            .find(|c| &c.blob.noise_static_pub == remote_static)
+            .map(|c| c.short_label())
+            .unwrap_or_else(|| "unknown".to_string())
+    }
+
+    pub fn send_to_contact(
+        &mut self,
+        query: &str,
+        text: &str,
+        cmd_tx: &mpsc::Sender<TransportCmd>,
+    ) {
+        let matches: Vec<usize> = self
+            .contacts
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.matches_query(query))
+            .map(|(i, _)| i)
+            .collect();
+        let i = match matches.as_slice() {
+            [] => {
+                self.push_system(format!("no contact matches {query:?}"));
+                return;
+            }
+            [i] => *i,
+            _ => {
+                self.push_system(format!(
+                    "multiple contacts match {query:?}. be more specific."
+                ));
+                return;
+            }
+        };
+        if self.contacts[i].status != ContactStatus::Verified {
+            let label = self.contacts[i].short_label();
+            self.push_system(format!(
+                "{label} is not verified. /verify them first."
+            ));
+            return;
+        }
+        let remote_static = self.contacts[i].blob.noise_static_pub;
+        let label = self.contacts[i].short_label();
+        if cmd_tx
+            .try_send(TransportCmd::SendMessage {
+                remote_static,
+                text: text.to_string(),
+            })
+            .is_err()
+        {
+            self.push_system("send queue full");
+            return;
+        }
+        self.push_outgoing(label, text.to_string());
     }
 }
 
@@ -351,7 +433,7 @@ async fn run_loop(
             Some(ev) = events.next() => {
                 match ev {
                     Ok(event) => {
-                        if let Some(cmd) = input::handle(&mut app, event) {
+                        if let Some(cmd) = input::handle(&mut app, event, cmd_tx) {
                             let _ = cmd_tx.send(cmd).await;
                         }
                     }

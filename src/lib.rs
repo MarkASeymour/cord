@@ -2,6 +2,7 @@ pub mod contacts;
 pub mod discovery;
 pub mod errors;
 pub mod identity;
+pub mod messaging;
 pub mod noise;
 pub mod runtime;
 pub mod transport;
