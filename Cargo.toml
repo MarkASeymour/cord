@@ -1,0 +1,29 @@
+[package]
+name = "cord"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+argh = "0.1"
+arti-client = { version = "0.42", default-features = false, features = ["tokio", "rustls", "compression", "onion-service-service"] }
+crossterm = { version = "0.28", features = ["event-stream"] }
+directories = "5"
+futures = "0.3"
+mdns-sd = "0.11"
+rand = "0.8"
+ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
+safelog = "0.8"
+snow = { version = "0.10", default-features = false, features = ["use-curve25519", "use-chacha20poly1305", "use-blake2", "use-getrandom", "std"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+tor-cell = "0.42"
+tor-hscrypto = "0.42"
+tor-hsservice = "0.42"
+tor-rtcompat = "0.42"
+zeroize = { version = "1.8", features = ["zeroize_derive"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+panic = "abort"
