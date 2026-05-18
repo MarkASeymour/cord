@@ -653,6 +653,7 @@ dependencies = [
  "tor-hscrypto",
  "tor-hsservice",
  "tor-rtcompat",
+ "x25519-dalek",
  "zeroize",
 ]
 

@@ -259,13 +259,7 @@ impl App {
             self.push_system("/share: wait for Tor bootstrap to finish first.");
             return;
         };
-        let noise_pub: [u8; 32] = match self.identity.noise_static.as_bytes().try_into() {
-            Ok(arr) => arr,
-            Err(_) => {
-                self.push_system("/share: noise key has wrong length (internal bug).");
-                return;
-            }
-        };
+        let noise_pub: [u8; 32] = *self.identity.noise_static.public_bytes();
         let blob = ContactBlob {
             noise_static_pub: noise_pub,
             hs_id: *hs_id,

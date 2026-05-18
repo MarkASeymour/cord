@@ -16,7 +16,8 @@ const MAX_MSG: usize = 65535;
 
 #[derive(Clone)]
 pub struct StaticKey {
-    bytes: Vec<u8>,
+    private: Vec<u8>,
+    public: [u8; NOISE_STATIC_LEN],
 }
 
 impl StaticKey {
@@ -27,29 +28,42 @@ impl StaticKey {
                 .map_err(|_| NoiseError::BadPattern)?,
         );
         let keypair = builder.generate_keypair().map_err(NoiseError::from)?;
-        Ok(Self {
-            bytes: keypair.private,
-        })
+        Self::from_private_bytes(keypair.private)
     }
 
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, NoiseError> {
+        Self::from_private_bytes(bytes)
+    }
+
+    fn from_private_bytes(bytes: Vec<u8>) -> Result<Self, NoiseError> {
         if bytes.len() != NOISE_STATIC_LEN {
             return Err(NoiseError::BadPayload(format!(
                 "noise static key must be {NOISE_STATIC_LEN} bytes, got {}",
                 bytes.len()
             )));
         }
-        Ok(Self { bytes })
+        let mut private_arr = [0u8; NOISE_STATIC_LEN];
+        private_arr.copy_from_slice(&bytes);
+        let secret = x25519_dalek::StaticSecret::from(private_arr);
+        let public = *x25519_dalek::PublicKey::from(&secret).as_bytes();
+        Ok(Self {
+            private: bytes,
+            public,
+        })
     }
 
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.bytes
+    pub fn private_bytes(&self) -> &[u8] {
+        &self.private
+    }
+
+    pub fn public_bytes(&self) -> &[u8; NOISE_STATIC_LEN] {
+        &self.public
     }
 }
 
 impl Drop for StaticKey {
     fn drop(&mut self) {
-        self.bytes.zeroize();
+        self.private.zeroize();
     }
 }
 
@@ -115,7 +129,7 @@ where
 {
     let builder = Builder::new(NOISE_PATTERN.parse().map_err(|_| NoiseError::BadPattern)?);
     let mut state = builder
-        .local_private_key(local_static.as_bytes())?
+        .local_private_key(local_static.private_bytes())?
         .build_initiator()?;
 
     let mut buf = vec![0u8; MAX_MSG];
@@ -146,7 +160,7 @@ where
 {
     let builder = Builder::new(NOISE_PATTERN.parse().map_err(|_| NoiseError::BadPattern)?);
     let mut state = builder
-        .local_private_key(local_static.as_bytes())?
+        .local_private_key(local_static.private_bytes())?
         .build_responder()?;
 
     let mut buf = vec![0u8; MAX_MSG];

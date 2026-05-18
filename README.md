@@ -2,7 +2,7 @@
 
 A serverless peer to peer terminal messenger that talks over Tor v3 onion services. Each cord process hosts its own onion service internally. No central server.
 
-Pre alpha. Pairing and message framing are not implemented yet.
+Pre alpha. Expect rough edges, including occasional protocol-level changes that invalidate previously shared contact blobs.
 
 ## Requirements
 

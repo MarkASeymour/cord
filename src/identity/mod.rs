@@ -138,7 +138,7 @@ fn load_or_generate_noise_static(config_dir: &Path) -> Result<StaticKey, Identit
         Ok(StaticKey::from_bytes(raw)?)
     } else {
         let key = StaticKey::generate()?;
-        store::write_atomic_0600(&path, key.as_bytes())?;
+        store::write_atomic_0600(&path, key.private_bytes())?;
         Ok(key)
     }
 }
@@ -180,11 +180,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("cord-noise-{:x}", rand::random::<u64>()));
 
         let first = load_or_generate(Some(dir.clone())).unwrap();
-        let first_bytes = first.noise_static.as_bytes().to_vec();
+        let first_bytes = first.noise_static.private_bytes().to_vec();
         assert_eq!(first_bytes.len(), 32);
 
         let second = load_or_generate(Some(dir.clone())).unwrap();
-        assert_eq!(second.noise_static.as_bytes(), &first_bytes[..]);
+        assert_eq!(second.noise_static.private_bytes(), &first_bytes[..]);
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

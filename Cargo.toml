@@ -22,6 +22,7 @@ snow = { version = "0.10", default-features = false, features = ["use-curve25519
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 tor-cell = "0.42"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
 tor-hscrypto = "0.42"
 tor-hsservice = "0.42"
 tor-rtcompat = "0.42"
