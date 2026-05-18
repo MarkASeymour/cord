@@ -75,6 +75,16 @@ pub fn render(frame: &mut Frame, app: &App) {
 fn transport_label(state: &TransportState) -> String {
     match state {
         TransportState::Bootstrapping => "bootstrapping…".to_string(),
+        TransportState::BootstrappingTor {
+            percent,
+            summary,
+            lan: Some(lan),
+        } => format!("tor: {percent}% ({summary})  lan ({lan})"),
+        TransportState::BootstrappingTor {
+            percent,
+            summary,
+            lan: None,
+        } => format!("tor: {percent}% ({summary})"),
         TransportState::Lan { listening_on } => format!("lan ({listening_on})"),
         TransportState::Onion { lan: Some(lan), .. } => {
             format!("onion + lan ({lan})")

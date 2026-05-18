@@ -8,6 +8,7 @@ pub enum AppMsg {
     TransportReady(LocalAddrs),
     OnionReady { onion_name: String, hs_id: [u8; 32] },
     OnionFailed(String),
+    TorProgress { percent: u8, summary: String },
     PeerDiscovered { peer_id: PeerId, addr: SocketAddr },
     PeerLost(PeerId),
     HandshakeOk {

@@ -41,6 +41,11 @@ pub struct App {
 
 pub enum TransportState {
     Bootstrapping,
+    BootstrappingTor {
+        percent: u8,
+        summary: String,
+        lan: Option<SocketAddr>,
+    },
     Lan {
         listening_on: SocketAddr,
     },
@@ -258,9 +263,29 @@ impl App {
                         hs_id,
                         lan: Some(lan),
                     },
+                    TransportState::BootstrappingTor {
+                        percent, summary, ..
+                    } => TransportState::BootstrappingTor {
+                        percent,
+                        summary,
+                        lan: Some(lan),
+                    },
                     _ => TransportState::Lan { listening_on: lan },
                 };
                 self.push_system(format!("lan listening on {lan}"));
+            }
+            AppMsg::TorProgress { percent, summary } => {
+                let lan = match &self.transport_state {
+                    TransportState::Lan { listening_on } => Some(*listening_on),
+                    TransportState::BootstrappingTor { lan, .. } => *lan,
+                    TransportState::Onion { lan, .. } => *lan,
+                    _ => None,
+                };
+                self.transport_state = TransportState::BootstrappingTor {
+                    percent,
+                    summary,
+                    lan,
+                };
             }
             AppMsg::OnionReady { onion_name, hs_id } => {
                 let lan = match &self.transport_state {

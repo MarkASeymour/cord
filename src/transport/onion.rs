@@ -3,10 +3,13 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use arti_client::{TorClient, TorClientConfig};
-use futures::Stream;
+use futures::{Stream, StreamExt};
 use safelog::DisplayRedacted;
+use tokio::sync::mpsc;
 use tor_hsservice::{config::OnionServiceConfigBuilder, HsNickname, RendRequest, RunningOnionService};
 use tor_rtcompat::PreferredRuntime;
+
+use crate::runtime::events::AppMsg;
 
 use super::TransportError;
 
@@ -20,9 +23,41 @@ pub struct OnionLaunch {
     pub rend_requests: RendStream,
 }
 
-pub async fn launch(_config_dir: PathBuf) -> Result<OnionLaunch, TransportError> {
+pub async fn launch(
+    _config_dir: PathBuf,
+    msg_tx: mpsc::Sender<AppMsg>,
+) -> Result<OnionLaunch, TransportError> {
     let config = TorClientConfig::default();
-    let tor_client = TorClient::create_bootstrapped(config).await?;
+    let tor_client = TorClient::builder()
+        .config(config)
+        .create_unbootstrapped()?;
+
+    let mut events = tor_client.bootstrap_events();
+    let progress_tx = msg_tx.clone();
+    let progress_task = tokio::spawn(async move {
+        let mut last_reported = 255u8;
+        while let Some(status) = events.next().await {
+            let percent = (status.as_frac() * 100.0).round() as u8;
+            let summary = status.to_string();
+            if percent != last_reported {
+                last_reported = percent;
+                if progress_tx
+                    .send(AppMsg::TorProgress { percent, summary })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            if status.ready_for_traffic() {
+                break;
+            }
+        }
+    });
+
+    let bootstrap_result = tor_client.bootstrap().await;
+    progress_task.abort();
+    bootstrap_result?;
 
     let nickname: HsNickname = "cord"
         .to_owned()

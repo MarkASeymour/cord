@@ -222,7 +222,7 @@ fn spawn_onion(
         let _ = msg_tx
             .send(AppMsg::Log("tor: bootstrapping (this may take 10 to 30s)…".into()))
             .await;
-        let launch = match onion::launch(config_dir).await {
+        let launch = match onion::launch(config_dir, msg_tx.clone()).await {
             Ok(l) => l,
             Err(e) => {
                 let _ = msg_tx.send(AppMsg::OnionFailed(e.to_string())).await;
