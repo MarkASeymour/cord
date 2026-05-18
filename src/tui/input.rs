@@ -116,14 +116,25 @@ fn submit(app: &mut App, cmd_tx: &mpsc::Sender<TransportCmd>) -> Option<Transpor
         }
         return None;
     }
-    if let Some(addr) = text.strip_prefix("/connect ") {
-        let addr = addr.trim().to_string();
-        if addr.is_empty() {
-            app.push_system("usage: /connect <address>");
+    if let Some(arg) = text.strip_prefix("/connect ") {
+        let arg = arg.trim().to_string();
+        if arg.is_empty() {
+            app.push_system("usage: /connect <name-or-hex> (or a full .onion address)");
             return None;
         }
-        app.push_system(format!("dispatching /connect {addr}"));
-        return Some(TransportCmd::ConnectOnion(addr));
+        let address = if arg.ends_with(".onion") {
+            arg
+        } else {
+            match app.resolve_contact_onion(&arg) {
+                Ok(a) => a,
+                Err(msg) => {
+                    app.push_system(msg);
+                    return None;
+                }
+            }
+        };
+        app.push_system(format!("dispatching /connect {address}"));
+        return Some(TransportCmd::ConnectOnion(address));
     }
     if text == "/quit" || text == "/q" {
         app.should_quit = true;
@@ -145,7 +156,7 @@ fn show_help(app: &mut App) {
     app.push_system("  /verify <name-or-hex>  upgrade a pending contact to verified (after comparing the SAS aloud)");
     app.push_system("  /reject <name-or-hex>  mark a contact as rejected");
     app.push_system("  /msg <name> <text>   send a text message to a verified contact");
-    app.push_system("  /connect <address>   dial a peer over Tor (debug only)");
+    app.push_system("  /connect <name-or-hex>  dial a verified contact (or a raw .onion address)");
     app.push_system("  /help, /?            show this");
     app.push_system("  /quit, /q            exit");
     app.push_system("keys:");

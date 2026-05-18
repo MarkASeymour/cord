@@ -14,6 +14,9 @@ use ratatui::Terminal;
 use tokio::sync::mpsc;
 use tokio::time::interval;
 
+use safelog::DisplayRedacted;
+use tor_hscrypto::pk::HsId;
+
 use crate::contacts::{self, Contact, ContactBlob, ContactStatus};
 use crate::discovery::KnownPeer;
 use crate::errors::CordError;
@@ -351,6 +354,24 @@ impl App {
             .find(|c| &c.blob.noise_static_pub == remote_static)
             .map(|c| c.short_label())
             .unwrap_or_else(|| "unknown".to_string())
+    }
+
+    pub fn resolve_contact_onion(&self, query: &str) -> Result<String, String> {
+        let matches: Vec<&Contact> = self
+            .contacts
+            .iter()
+            .filter(|c| c.matches_query(query))
+            .collect();
+        let contact = match matches.as_slice() {
+            [] => return Err(format!("no contact matches {query:?}")),
+            [c] => *c,
+            _ => return Err(format!(
+                "multiple contacts match {query:?}. be more specific."
+            )),
+        };
+        let hs_id = HsId::from(contact.blob.hs_id);
+        let address = hs_id.display_unredacted().to_string();
+        Ok(address)
     }
 
     pub fn send_to_contact(

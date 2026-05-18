@@ -44,7 +44,7 @@ Type `/help` and press Enter to list every command. Quick reference:
 - `/verify <name-or-hex>` upgrade a pending contact to verified, after you have compared the SAS aloud.
 - `/reject <name-or-hex>` mark a contact as rejected.
 - `/msg <name> <text>` send a text message to a verified contact.
-- `/connect <address>` dial a peer over Tor (debug only).
+- `/connect <name-or-hex>` dial a verified contact over Tor (or paste a raw `.onion` address for a debug connection).
 - `/quit` exit.
 - Esc or Ctrl C exit.
 - Enter submit.
