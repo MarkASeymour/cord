@@ -121,27 +121,73 @@ impl App {
                 return;
             }
         };
-        if let Some(existing) = self
+        let label = blob.display_name.clone().unwrap_or_else(|| "(no name)".into());
+        let existing = self
             .contacts
             .iter()
-            .find(|c| c.blob.noise_static_pub == blob.noise_static_pub)
-        {
-            self.push_system(format!(
-                "already paired with {} ({})",
-                existing.short_label(),
-                existing.status.label()
-            ));
-            return;
+            .position(|c| c.blob.noise_static_pub == blob.noise_static_pub);
+        match existing {
+            Some(i) => match self.contacts[i].status {
+                ContactStatus::Verified => {
+                    self.push_system(format!(
+                        "already verified: {}. use /unpair {} first if you want to re-pair.",
+                        self.contacts[i].short_label(),
+                        self.contacts[i].short_label()
+                    ));
+                }
+                ContactStatus::Pending => {
+                    self.push_system(format!(
+                        "already pending: {}. compare SAS then /verify or /reject.",
+                        self.contacts[i].short_label()
+                    ));
+                }
+                ContactStatus::Rejected => {
+                    self.contacts[i].blob = blob;
+                    self.contacts[i].status = ContactStatus::Pending;
+                    let saved = self.contacts[i].short_label();
+                    if let Err(e) = contacts::save(&self.identity.config_dir, &self.contacts)
+                    {
+                        self.push_system(format!("contacts: save failed: {e}"));
+                    }
+                    self.push_system(format!(
+                        "reopened previously rejected contact as pending: {saved}"
+                    ));
+                }
+            },
+            None => {
+                self.contacts.push(Contact {
+                    blob,
+                    status: ContactStatus::Pending,
+                });
+                if let Err(e) = contacts::save(&self.identity.config_dir, &self.contacts) {
+                    self.push_system(format!("contacts: save failed: {e}"));
+                }
+                self.push_system(format!("added pending contact: {label}"));
+            }
         }
-        let label = blob.display_name.clone().unwrap_or_else(|| "(no name)".into());
-        self.contacts.push(Contact {
-            blob,
-            status: ContactStatus::Pending,
-        });
-        if let Err(e) = contacts::save(&self.identity.config_dir, &self.contacts) {
-            self.push_system(format!("contacts: save failed: {e}"));
+    }
+
+    pub fn unpair_contact(&mut self, query: &str) {
+        let matches: Vec<usize> = self
+            .contacts
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.matches_query(query))
+            .map(|(i, _)| i)
+            .collect();
+        match matches.as_slice() {
+            [] => self.push_system(format!("no contact matches {query:?}")),
+            [i] => {
+                let removed = self.contacts.remove(*i);
+                if let Err(e) = contacts::save(&self.identity.config_dir, &self.contacts) {
+                    self.push_system(format!("contacts: save failed: {e}"));
+                }
+                self.push_system(format!("removed contact: {}", removed.short_label()));
+            }
+            _ => self.push_system(format!(
+                "multiple contacts match {query:?}. be more specific."
+            )),
         }
-        self.push_system(format!("added pending contact: {label}"));
     }
 
     pub fn verify_contact(&mut self, query: &str) {

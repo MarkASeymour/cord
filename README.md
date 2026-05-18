@@ -43,6 +43,7 @@ Type `/help` and press Enter to list every command. Quick reference:
 - `/contacts` list paired contacts and their status.
 - `/verify <name-or-hex>` upgrade a pending contact to verified, after you have compared the SAS aloud.
 - `/reject <name-or-hex>` mark a contact as rejected.
+- `/unpair <name-or-hex>` remove a contact entirely. Use when you want to start over.
 - `/msg <name> <text>` send a text message to a verified contact.
 - `/connect <name-or-hex>` dial a verified contact over Tor (or paste a raw `.onion` address for a debug connection).
 - `/quit` exit.
@@ -62,6 +63,10 @@ To pair with someone:
 3. Each runs `/pair <blob>` to add the other's blob. The status starts `pending`.
 4. When the two cord instances first connect, both chat logs print a short authentication string of 18 digits in six groups of three (about 60 bits of entropy) and identify which pending contact it belongs to. Both users read it aloud on a separate channel.
 5. If the codes match on both ends, each user runs `/verify <name-or-hex>` to upgrade the contact to `verified`. If they do not match, run `/reject <name-or-hex>` and start over; you are being intercepted.
+
+In `/verify`, `/reject`, and `/unpair`, the argument can be the display name (case insensitive) or a hex prefix of the peer's Noise public key (at least 4 hex characters).
+
+If you `/pair` a blob whose key matches a contact you previously rejected, cord reopens that entry as pending so you can retry verification. To wipe the entry instead, use `/unpair <name-or-hex>` first.
 
 Contacts persist at `<config_dir>/contacts` with 0600 file mode.
 

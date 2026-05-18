@@ -34,28 +34,56 @@ pub async fn launch(
 
     let mut events = tor_client.bootstrap_events();
     let progress_tx = msg_tx.clone();
+    let _ = progress_tx
+        .send(AppMsg::Log("tor: watching bootstrap events".into()))
+        .await;
     let progress_task = tokio::spawn(async move {
         let mut last_reported = 255u8;
+        let mut last_milestone = 0u8;
+        let mut first = true;
         while let Some(status) = events.next().await {
             let percent = (status.as_frac() * 100.0).round() as u8;
             let summary = status.to_string();
+            if first {
+                first = false;
+                let _ = progress_tx
+                    .send(AppMsg::Log(format!(
+                        "tor: first bootstrap event at {percent}% ({summary})"
+                    )))
+                    .await;
+            }
             if percent != last_reported {
                 last_reported = percent;
                 if progress_tx
-                    .send(AppMsg::TorProgress { percent, summary })
+                    .send(AppMsg::TorProgress {
+                        percent,
+                        summary: summary.clone(),
+                    })
                     .await
                     .is_err()
                 {
                     break;
                 }
             }
+            if percent / 25 > last_milestone / 25 && percent > 0 {
+                last_milestone = percent;
+                let _ = progress_tx
+                    .send(AppMsg::Log(format!("tor: bootstrap {percent}%")))
+                    .await;
+            }
             if status.ready_for_traffic() {
+                let _ = progress_tx
+                    .send(AppMsg::Log("tor: bootstrap complete".into()))
+                    .await;
                 break;
             }
         }
     });
 
     let bootstrap_result = tor_client.bootstrap().await;
+    let _ = msg_tx
+        .send(AppMsg::Log("tor: bootstrap call returned".into()))
+        .await;
     progress_task.abort();
     bootstrap_result?;
 

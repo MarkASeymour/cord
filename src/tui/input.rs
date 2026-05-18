@@ -103,6 +103,15 @@ fn submit(app: &mut App, cmd_tx: &mpsc::Sender<TransportCmd>) -> Option<Transpor
         app.reject_contact(q);
         return None;
     }
+    if let Some(rest) = text.strip_prefix("/unpair ") {
+        let q = rest.trim();
+        if q.is_empty() {
+            app.push_system("usage: /unpair <name-or-hex>");
+            return None;
+        }
+        app.unpair_contact(q);
+        return None;
+    }
     if text == "/share" {
         app.share_blob(None);
         return None;
@@ -155,6 +164,7 @@ fn show_help(app: &mut App) {
     app.push_system("  /contacts            list paired contacts");
     app.push_system("  /verify <name-or-hex>  upgrade a pending contact to verified (after comparing the SAS aloud)");
     app.push_system("  /reject <name-or-hex>  mark a contact as rejected");
+    app.push_system("  /unpair <name-or-hex>  remove a contact entirely (use to start over)");
     app.push_system("  /msg <name> <text>   send a text message to a verified contact");
     app.push_system("  /connect <name-or-hex>  dial a verified contact (or a raw .onion address)");
     app.push_system("  /help, /?            show this");
