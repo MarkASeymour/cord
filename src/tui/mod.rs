@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Stdout};
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -21,7 +21,7 @@ use crate::contacts::{self, Contact, ContactBlob, ContactStatus};
 use crate::discovery::KnownPeer;
 use crate::errors::CordError;
 use crate::identity::{Identity, PeerId};
-use crate::runtime::events::{AppMsg, LocalAddrs, TransportCmd};
+use crate::runtime::events::{AppMsg, DeliveryStatus, LocalAddrs, TransportCmd};
 
 pub mod input;
 pub mod layout;
@@ -36,6 +36,10 @@ pub struct App {
     pub contacts: Vec<Contact>,
     pub chat_log: VecDeque<ChatEntry>,
     pub input_buffer: String,
+    pub mode: InputMode,
+    pub vault_ready: bool,
+    pub vault_locked: bool,
+    pub connected: HashSet<[u8; 32]>,
     pub should_quit: bool,
 }
 
@@ -60,7 +64,84 @@ pub enum TransportState {
 pub enum ChatEntry {
     System(String),
     Incoming { from: String, text: String },
-    Outgoing { to: String, text: String },
+    Outgoing {
+        to: String,
+        text: String,
+        id: u64,
+        status: DeliveryStatus,
+    },
+}
+
+/// Whether keystrokes go to the chat input line or to a masked passphrase
+/// prompt overlaid on it.
+pub enum InputMode {
+    Normal,
+    Passphrase(PassphrasePrompt),
+    Confirm(ConfirmPrompt),
+}
+
+/// A yes or no prompt asking whether to queue a message that could not be sent
+/// right now. The message is held here until the user decides; on no it is
+/// dropped without ever being sent or queued.
+pub struct ConfirmPrompt {
+    pub remote_static: [u8; 32],
+    pub id: u64,
+    pub text: String,
+    pub label: String,
+}
+
+impl ConfirmPrompt {
+    pub fn question(&self) -> String {
+        let mut preview: String = self.text.chars().take(40).collect();
+        if self.text.chars().count() > 40 {
+            preview.push('…');
+        }
+        format!(
+            "{} is offline. queue \"{}\" for delivery on reconnect? (y / n)",
+            self.label, preview
+        )
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PassphrasePurpose {
+    Create,
+    Unlock,
+}
+
+pub enum PassphraseStage {
+    Enter,
+    Confirm { first: String },
+    Waiting,
+}
+
+pub struct PassphrasePrompt {
+    pub purpose: PassphrasePurpose,
+    pub stage: PassphraseStage,
+    pub buffer: String,
+    pub error: Option<String>,
+}
+
+impl PassphrasePrompt {
+    fn new(purpose: PassphrasePurpose) -> Self {
+        Self {
+            purpose,
+            stage: PassphraseStage::Enter,
+            buffer: String::new(),
+            error: None,
+        }
+    }
+
+    pub fn title(&self) -> &'static str {
+        match self.stage {
+            PassphraseStage::Waiting => "working…",
+            PassphraseStage::Confirm { .. } => "confirm passphrase",
+            PassphraseStage::Enter => match self.purpose {
+                PassphrasePurpose::Create => "set a queue passphrase",
+                PassphrasePurpose::Unlock => "unlock queue",
+            },
+        }
+    }
 }
 
 impl App {
@@ -109,6 +190,10 @@ impl App {
             contacts,
             chat_log,
             input_buffer: String::new(),
+            mode: InputMode::Normal,
+            vault_ready: false,
+            vault_locked: false,
+            connected: HashSet::new(),
             should_quit: false,
         }
     }
@@ -277,8 +362,13 @@ impl App {
         self.push_entry(ChatEntry::Incoming { from, text });
     }
 
-    pub fn push_outgoing(&mut self, to: String, text: String) {
-        self.push_entry(ChatEntry::Outgoing { to, text });
+    pub fn push_outgoing(&mut self, to: String, text: String, id: u64, status: DeliveryStatus) {
+        self.push_entry(ChatEntry::Outgoing {
+            to,
+            text,
+            id,
+            status,
+        });
     }
 
     fn push_entry(&mut self, entry: ChatEntry) {
@@ -354,6 +444,7 @@ impl App {
                 }
             }
             AppMsg::HandshakeOk { peer_id, role, sas, remote_static } => {
+                self.connected.insert(remote_static);
                 self.push_system(format!(
                     "handshake ok ({}): {}",
                     role.label(),
@@ -407,8 +498,37 @@ impl App {
                 self.push_incoming(from, text);
             }
             AppMsg::PeerDisconnected { remote_static, .. } => {
+                self.connected.remove(&remote_static);
                 let who = self.label_for_remote(&remote_static);
                 self.push_system(format!("disconnected: {who}"));
+            }
+            AppMsg::DeliveryUpdate { id, status } => self.update_delivery(id, status),
+            AppMsg::VaultLocked => {
+                self.vault_locked = true;
+                self.push_system(
+                    "a saved message queue was found. enter your passphrase to unlock and resume pending deliveries (Esc to skip).",
+                );
+                if matches!(self.mode, InputMode::Normal) {
+                    self.mode =
+                        InputMode::Passphrase(PassphrasePrompt::new(PassphrasePurpose::Unlock));
+                }
+            }
+            AppMsg::VaultReady => {
+                self.vault_ready = true;
+                self.vault_locked = false;
+                self.mode = InputMode::Normal;
+                self.push_system(
+                    "offline queue ready. messages to an offline contact are held and delivered when they reconnect.",
+                );
+            }
+            AppMsg::VaultFailed(msg) => {
+                if let InputMode::Passphrase(p) = &mut self.mode {
+                    p.stage = PassphraseStage::Enter;
+                    p.buffer.clear();
+                    p.error = Some(msg);
+                } else {
+                    self.push_system(format!("vault: {msg}"));
+                }
             }
         }
     }
@@ -419,6 +539,31 @@ impl App {
             .find(|c| &c.blob.noise_static_pub == remote_static)
             .map(|c| c.short_label())
             .unwrap_or_else(|| "unknown".to_string())
+    }
+
+    fn update_delivery(&mut self, id: u64, status: DeliveryStatus) {
+        // The matching message is almost always recent, so scan newest first.
+        for entry in self.chat_log.iter_mut().rev() {
+            if let ChatEntry::Outgoing {
+                id: entry_id,
+                status: entry_status,
+                ..
+            } = entry
+            {
+                if *entry_id == id {
+                    *entry_status = status;
+                    return;
+                }
+            }
+        }
+    }
+
+    pub fn begin_passphrase_create(&mut self) {
+        self.mode = InputMode::Passphrase(PassphrasePrompt::new(PassphrasePurpose::Create));
+    }
+
+    pub fn begin_passphrase_unlock(&mut self) {
+        self.mode = InputMode::Passphrase(PassphrasePrompt::new(PassphrasePurpose::Unlock));
     }
 
     pub fn resolve_contact_onion(&self, query: &str) -> Result<String, String> {
@@ -474,17 +619,39 @@ impl App {
         }
         let remote_static = self.contacts[i].blob.noise_static_pub;
         let label = self.contacts[i].short_label();
-        if cmd_tx
-            .try_send(TransportCmd::SendMessage {
+        let id = rand::random::<u64>();
+
+        if self.connected.contains(&remote_static) {
+            // a live connection exists: send straight away
+            if cmd_tx
+                .try_send(TransportCmd::SendMessage {
+                    remote_static,
+                    id,
+                    text: text.to_string(),
+                })
+                .is_err()
+            {
+                self.push_system("send queue full");
+                return;
+            }
+            self.push_outgoing(label, text.to_string(), id, DeliveryStatus::Sending);
+        } else if self.vault_ready {
+            // recipient offline but queueable: ask before queueing
+            self.mode = InputMode::Confirm(ConfirmPrompt {
                 remote_static,
+                id,
                 text: text.to_string(),
-            })
-            .is_err()
-        {
-            self.push_system("send queue full");
-            return;
+                label,
+            });
+        } else if self.vault_locked {
+            self.push_system(format!(
+                "{label} is offline and the queue is locked. /unlock first, then resend."
+            ));
+        } else {
+            self.push_system(format!(
+                "{label} is offline. set a passphrase with /passphrase to enable the offline queue, then resend."
+            ));
         }
-        self.push_outgoing(label, text.to_string());
     }
 }
 

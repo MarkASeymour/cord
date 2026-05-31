@@ -1,4 +1,5 @@
 pub mod contacts;
+pub mod crypto;
 pub mod discovery;
 pub mod errors;
 pub mod identity;

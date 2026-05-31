@@ -46,6 +46,8 @@ Type `/help` and press Enter to list every command. Quick reference:
 - `/unpair <name-or-hex>` remove a contact entirely. Use when you want to start over.
 - `/msg <name> <text>` send a text message to a verified contact.
 - `/connect <name-or-hex>` dial a verified contact over Tor (or paste a raw `.onion` address for a debug connection).
+- `/passphrase` set a passphrase to enable the encrypted offline queue.
+- `/unlock` unlock the offline queue for the current session.
 - `/quit` exit.
 - Esc or Ctrl C exit.
 - Enter submit.
@@ -72,16 +74,50 @@ Contacts persist at `<config_dir>/contacts` with 0600 file mode.
 
 ## Messaging
 
-Once two cord users have paired and verified each other, the `/msg` command sends UTF-8 text over the open Noise channel.
+Once two cord users have paired and verified each other, the `/msg` command sends UTF-8 text over the Noise channel.
 
     /msg alice hey, this works
 
 Requirements:
 
 - The contact must be `Verified`. Pending and rejected contacts cannot receive messages.
-- A live connection must already exist. On LAN, that means the peer was auto discovered through mDNS and handshook. Over Tor, that means someone ran `/connect <address>` on at least one side. The recipient must be online at the moment you send. There is no message queue yet; sending to an offline peer fails immediately.
+- On LAN a connection forms automatically once the peer is discovered through mDNS. Over Tor, someone runs `/connect <name-or-hex>` on one side.
 
-Incoming messages appear in the chat log with the sender's name in bold. Outgoing messages echo back dimmed with a `you →` prefix. The full message history persists only in memory for the current session; no on disk history yet.
+Incoming messages appear in the chat log with the sender's name in bold. Outgoing messages echo back dimmed with a `you →` prefix and a delivery marker that updates in place:
+
+- `sending…` while the message leaves your machine
+- `sent` once it reaches the peer's connection
+- `delivered ✓` in green once the peer acknowledges receipt
+- `queued` if the recipient was offline and you chose to hold the message for later (see below)
+- `failed ✗` in red if it could not be sent or queued
+
+The chat history for the current session lives only in memory. cord keeps no readable message history on disk.
+
+## Offline queue
+
+If you `/msg` a verified contact who is not connected right now, cord asks whether to queue the message:
+
+    alice is offline. queue "your message" for delivery on reconnect? (y / n)
+
+Press `y` to hold it in an encrypted on disk queue. It shows as `queued`, and on the next connection to that contact it is resent, acknowledged, and flipped to `delivered ✓`. Press `n` or Esc to discard the message; it is never sent or stored.
+
+The queue is encrypted at rest with a passphrase you choose, because it is the only place your message content ever touches disk. Before cord will queue anything, set a passphrase once:
+
+    /passphrase
+
+You type it twice to confirm. cord derives a key from it with Argon2id; that key wraps a random master key (sealed with XChaCha20 Poly1305) that in turn seals the queue files. The wrapped master key lives at `<config_dir>/queue.key` with 0600 file mode. The passphrase itself is never stored.
+
+On a later run, if a queue already exists cord prompts you to unlock it so pending messages can resume:
+
+    /unlock
+
+The status bar shows the queue state: `off` (no passphrase set yet), `locked` (set but not unlocked this run), or `on` (unlocked and ready). If you forget the passphrase the queued messages cannot be recovered; delete `<config_dir>/queue.key` and the `<config_dir>/queue/` directory to start fresh.
+
+Limits in this version:
+
+- Delivery is at least once. If a connection drops after the peer received a message but before its acknowledgement reached you, the message is resent on the next connect and the peer may see it twice.
+- A message sent over a live connection that is never acknowledged (the peer dropped right after connecting) is not queued and is not retried.
+- cord does not yet dial offline contacts on its own to flush the queue. Delivery happens the next time a connection forms through LAN discovery or `/connect`. Automatic background retry is the next milestone.
 
 ## Tests
 

@@ -14,15 +14,17 @@ use tor_cell::relaycell::msg::Connected;
 use tor_hsservice::{handle_rend_requests, StreamRequest};
 use tor_rtcompat::PreferredRuntime;
 
+use crate::crypto::{self, Vault};
 use crate::discovery::{mdns, PeerEvent};
 use crate::errors::CordError;
+use crate::identity::store::write_atomic_0600;
 use crate::identity::{Identity, PeerId};
-use crate::messaging::Frame;
+use crate::messaging::{Frame, Queue, QueuedMessage};
 use crate::noise::{self, NoiseStream, StaticKey};
 use crate::transport::lan::LanTransport;
 use crate::transport::onion::{self, OnionLaunch};
 
-use self::events::{AppMsg, LocalAddrs, Role, TransportCmd};
+use self::events::{AppMsg, DeliveryStatus, LocalAddrs, Role, TransportCmd};
 
 pub mod events;
 
@@ -30,6 +32,7 @@ const ONION_PORT: u16 = 1;
 const CONNECTION_QUEUE: usize = 32;
 
 type Connections = Arc<Mutex<HashMap<[u8; 32], mpsc::Sender<Frame>>>>;
+type SharedQueue = Arc<Mutex<Option<Queue>>>;
 
 pub struct TransportTask {
     pub handle: JoinHandle<()>,
@@ -48,6 +51,7 @@ pub async fn spawn(
     let local = lan.local_addr()?;
 
     let connections: Connections = Arc::new(Mutex::new(HashMap::new()));
+    let queue: SharedQueue = Arc::new(Mutex::new(None));
 
     let (peer_event_tx, peer_event_rx) = mpsc::channel(64);
     let mdns_handle = mdns::start(peer_id, local.port(), peer_event_tx)?;
@@ -55,6 +59,10 @@ pub async fn spawn(
     let _ = msg_tx
         .send(AppMsg::TransportReady(LocalAddrs { lan: local }))
         .await;
+
+    if crypto::vault_file_path(&config_dir).exists() {
+        let _ = msg_tx.send(AppMsg::VaultLocked).await;
+    }
 
     let in_flight: Arc<Mutex<HashSet<PeerId>>> = Arc::new(Mutex::new(HashSet::new()));
 
@@ -64,6 +72,7 @@ pub async fn spawn(
         peer_id,
         msg_tx.clone(),
         connections.clone(),
+        queue.clone(),
     );
     spawn_discovery_loop(
         peer_event_rx,
@@ -72,20 +81,24 @@ pub async fn spawn(
         in_flight,
         msg_tx.clone(),
         connections.clone(),
+        queue.clone(),
     );
 
     let (onion_connect_tx, onion_connect_rx) = mpsc::channel::<String>(8);
     spawn_onion(
-        config_dir,
+        config_dir.clone(),
         msg_tx.clone(),
         static_key.clone(),
         peer_id,
         onion_connect_rx,
         connections.clone(),
+        queue.clone(),
     );
 
     let route_msg_tx = msg_tx.clone();
     let route_connections = connections.clone();
+    let route_queue = queue.clone();
+    let route_config_dir = config_dir.clone();
     let handle = tokio::spawn(async move {
         let mut mdns_handle = Some(mdns_handle);
         while let Some(cmd) = cmd_rx.recv().await {
@@ -94,27 +107,139 @@ pub async fn spawn(
                 TransportCmd::ConnectOnion(addr) => {
                     let _ = onion_connect_tx.send(addr).await;
                 }
-                TransportCmd::SendMessage { remote_static, text } => {
+                TransportCmd::SetupVault(passphrase) => {
+                    let path = crypto::vault_file_path(&route_config_dir);
+                    if path.exists() {
+                        let _ = route_msg_tx
+                            .send(AppMsg::VaultFailed(
+                                "a vault already exists; use /unlock".into(),
+                            ))
+                            .await;
+                    } else {
+                        match Vault::create(&passphrase.0) {
+                            Ok((vault, file)) => match write_atomic_0600(&path, &file) {
+                                Ok(()) => {
+                                    *route_queue.lock().await =
+                                        Some(Queue::new(&route_config_dir, Arc::new(vault)));
+                                    let _ = route_msg_tx.send(AppMsg::VaultReady).await;
+                                }
+                                Err(e) => {
+                                    let _ = route_msg_tx
+                                        .send(AppMsg::VaultFailed(format!(
+                                            "could not write vault file: {e}"
+                                        )))
+                                        .await;
+                                }
+                            },
+                            Err(e) => {
+                                let _ = route_msg_tx
+                                    .send(AppMsg::VaultFailed(e.to_string()))
+                                    .await;
+                            }
+                        }
+                    }
+                }
+                TransportCmd::UnlockVault(passphrase) => {
+                    let path = crypto::vault_file_path(&route_config_dir);
+                    match std::fs::read(&path) {
+                        Ok(bytes) => match Vault::unlock(&passphrase.0, &bytes) {
+                            Ok(vault) => {
+                                *route_queue.lock().await =
+                                    Some(Queue::new(&route_config_dir, Arc::new(vault)));
+                                let _ = route_msg_tx.send(AppMsg::VaultReady).await;
+                            }
+                            Err(e) => {
+                                let _ = route_msg_tx
+                                    .send(AppMsg::VaultFailed(e.to_string()))
+                                    .await;
+                            }
+                        },
+                        Err(_) => {
+                            let _ = route_msg_tx
+                                .send(AppMsg::VaultFailed(
+                                    "no vault to unlock; use /passphrase to create one".into(),
+                                ))
+                                .await;
+                        }
+                    }
+                }
+                TransportCmd::SendMessage { remote_static, id, text } => {
                     let sender = {
                         let guard = route_connections.lock().await;
                         guard.get(&remote_static).cloned()
                     };
                     match sender {
                         Some(tx) => {
-                            if tx.send(Frame::Text(text)).await.is_err() {
+                            if tx.send(Frame::Msg { id, text }).await.is_ok() {
                                 let _ = route_msg_tx
-                                    .send(AppMsg::Log(
-                                        "send failed: connection closed".into(),
-                                    ))
+                                    .send(AppMsg::DeliveryUpdate {
+                                        id,
+                                        status: DeliveryStatus::Sent,
+                                    })
+                                    .await;
+                            } else {
+                                let _ = route_msg_tx
+                                    .send(AppMsg::DeliveryUpdate {
+                                        id,
+                                        status: DeliveryStatus::Failed,
+                                    })
+                                    .await;
+                                let _ = route_msg_tx
+                                    .send(AppMsg::Log("send failed: connection closed".into()))
                                     .await;
                             }
                         }
                         None => {
-                            let _ = route_msg_tx
-                                .send(AppMsg::Log(
-                                    "no active connection to that contact".into(),
-                                ))
-                                .await;
+                            // recipient offline: queue the message if a vault is ready
+                            let hex = hex32(&remote_static);
+                            let outcome = {
+                                let guard = route_queue.lock().await;
+                                guard
+                                    .as_ref()
+                                    .map(|q| q.enqueue(&hex, QueuedMessage { id, text }))
+                            };
+                            match outcome {
+                                Some(Ok(())) => {
+                                    let _ = route_msg_tx
+                                        .send(AppMsg::DeliveryUpdate {
+                                            id,
+                                            status: DeliveryStatus::Queued,
+                                        })
+                                        .await;
+                                    let _ = route_msg_tx
+                                        .send(AppMsg::Log(
+                                            "recipient offline: queued, will deliver on reconnect"
+                                                .into(),
+                                        ))
+                                        .await;
+                                }
+                                Some(Err(e)) => {
+                                    let _ = route_msg_tx
+                                        .send(AppMsg::DeliveryUpdate {
+                                            id,
+                                            status: DeliveryStatus::Failed,
+                                        })
+                                        .await;
+                                    let _ = route_msg_tx
+                                        .send(AppMsg::Log(format!("queue write failed: {e}")))
+                                        .await;
+                                }
+                                None => {
+                                    let _ = route_msg_tx
+                                        .send(AppMsg::DeliveryUpdate {
+                                            id,
+                                            status: DeliveryStatus::Failed,
+                                        })
+                                        .await;
+                                    let hint = if crypto::vault_file_path(&route_config_dir).exists()
+                                    {
+                                        "recipient offline and queue locked: /unlock first, then resend"
+                                    } else {
+                                        "recipient offline: set a passphrase with /passphrase to enable the offline queue, then resend"
+                                    };
+                                    let _ = route_msg_tx.send(AppMsg::Log(hint.into())).await;
+                                }
+                            }
                         }
                     }
                 }
@@ -134,6 +259,7 @@ fn spawn_accept_loop(
     own_id: PeerId,
     msg_tx: mpsc::Sender<AppMsg>,
     connections: Connections,
+    queue: SharedQueue,
 ) {
     tokio::spawn(async move {
         loop {
@@ -142,6 +268,7 @@ fn spawn_accept_loop(
                     let static_key = static_key.clone();
                     let msg_tx = msg_tx.clone();
                     let connections = connections.clone();
+                    let queue = queue.clone();
                     tokio::spawn(async move {
                         handshake_as_responder_tcp(
                             sock,
@@ -149,6 +276,7 @@ fn spawn_accept_loop(
                             own_id,
                             msg_tx,
                             connections,
+                            queue,
                         )
                         .await;
                     });
@@ -171,6 +299,7 @@ fn spawn_discovery_loop(
     in_flight: Arc<Mutex<HashSet<PeerId>>>,
     msg_tx: mpsc::Sender<AppMsg>,
     connections: Connections,
+    queue: SharedQueue,
 ) {
     tokio::spawn(async move {
         while let Some(event) = peer_event_rx.recv().await {
@@ -187,6 +316,7 @@ fn spawn_discovery_loop(
                             let msg_tx = msg_tx.clone();
                             let in_flight = in_flight.clone();
                             let connections = connections.clone();
+                            let queue = queue.clone();
                             tokio::spawn(async move {
                                 handshake_as_initiator_tcp(
                                     addr,
@@ -195,6 +325,7 @@ fn spawn_discovery_loop(
                                     peer_id,
                                     msg_tx,
                                     connections,
+                                    queue,
                                 )
                                 .await;
                                 in_flight.lock().await.remove(&peer_id);
@@ -217,6 +348,7 @@ fn spawn_onion(
     own_id: PeerId,
     mut connect_rx: mpsc::Receiver<String>,
     connections: Connections,
+    queue: SharedQueue,
 ) {
     tokio::spawn(async move {
         let _ = msg_tx
@@ -253,8 +385,9 @@ fn spawn_onion(
                     let static_key = static_key.clone();
                     let msg_tx = msg_tx.clone();
                     let connections = connections.clone();
+                    let queue = queue.clone();
                     tokio::spawn(async move {
-                        accept_onion_stream(req, static_key, own_id, msg_tx, connections).await;
+                        accept_onion_stream(req, static_key, own_id, msg_tx, connections, queue).await;
                     });
                 }
                 // outbound: user typed /connect
@@ -263,8 +396,9 @@ fn spawn_onion(
                     let static_key = static_key.clone();
                     let msg_tx = msg_tx.clone();
                     let connections = connections.clone();
+                    let queue = queue.clone();
                     tokio::spawn(async move {
-                        connect_onion_peer(client, addr_str, static_key, own_id, msg_tx, connections).await;
+                        connect_onion_peer(client, addr_str, static_key, own_id, msg_tx, connections, queue).await;
                     });
                 }
                 else => break,
@@ -281,6 +415,7 @@ async fn handshake_as_initiator_tcp(
     expected_peer_id: PeerId,
     msg_tx: mpsc::Sender<AppMsg>,
     connections: Connections,
+    queue: SharedQueue,
 ) {
     let result = async {
         let sock = TcpStream::connect(addr).await?;
@@ -299,8 +434,15 @@ async fn handshake_as_initiator_tcp(
     }
     .await;
 
-    handle_handshake_result(result, Role::Initiator, Some(expected_peer_id), msg_tx, connections)
-        .await;
+    handle_handshake_result(
+        result,
+        Role::Initiator,
+        Some(expected_peer_id),
+        msg_tx,
+        connections,
+        queue,
+    )
+    .await;
 }
 
 async fn handshake_as_responder_tcp(
@@ -309,6 +451,7 @@ async fn handshake_as_responder_tcp(
     own_id: PeerId,
     msg_tx: mpsc::Sender<AppMsg>,
     connections: Connections,
+    queue: SharedQueue,
 ) {
     let result = async {
         let mut stream = noise::handshake_responder(sock, &static_key).await?;
@@ -326,7 +469,7 @@ async fn handshake_as_responder_tcp(
     }
     .await;
 
-    handle_handshake_result(result, Role::Responder, None, msg_tx, connections).await;
+    handle_handshake_result(result, Role::Responder, None, msg_tx, connections, queue).await;
 }
 
 async fn accept_onion_stream(
@@ -335,6 +478,7 @@ async fn accept_onion_stream(
     own_id: PeerId,
     msg_tx: mpsc::Sender<AppMsg>,
     connections: Connections,
+    queue: SharedQueue,
 ) {
     let data_stream = match req.accept(Connected::new_empty()).await {
         Ok(s) => s,
@@ -357,7 +501,7 @@ async fn accept_onion_stream(
     }
     .await;
 
-    handle_handshake_result(result, Role::Responder, None, msg_tx, connections).await;
+    handle_handshake_result(result, Role::Responder, None, msg_tx, connections, queue).await;
 }
 
 async fn connect_onion_peer(
@@ -367,6 +511,7 @@ async fn connect_onion_peer(
     own_id: PeerId,
     msg_tx: mpsc::Sender<AppMsg>,
     connections: Connections,
+    queue: SharedQueue,
 ) {
     let trimmed = onion_addr.trim().to_string();
     let _ = msg_tx
@@ -388,7 +533,7 @@ async fn connect_onion_peer(
     }
     .await;
 
-    handle_handshake_result(result, Role::Initiator, None, msg_tx, connections).await;
+    handle_handshake_result(result, Role::Initiator, None, msg_tx, connections, queue).await;
 }
 
 async fn handle_handshake_result<S>(
@@ -397,13 +542,14 @@ async fn handle_handshake_result<S>(
     expected_peer_id: Option<PeerId>,
     msg_tx: mpsc::Sender<AppMsg>,
     connections: Connections,
+    queue: SharedQueue,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     match result {
         Ok((stream, peer_id, sas, remote_static)) => {
             let (send_tx, send_rx) = mpsc::channel::<Frame>(CONNECTION_QUEUE);
-            connections.lock().await.insert(remote_static, send_tx);
+            connections.lock().await.insert(remote_static, send_tx.clone());
             let _ = msg_tx
                 .send(AppMsg::HandshakeOk {
                     peer_id,
@@ -416,9 +562,11 @@ async fn handle_handshake_result<S>(
                 stream,
                 peer_id,
                 remote_static,
+                send_tx,
                 send_rx,
                 msg_tx,
                 connections,
+                queue,
             ));
         }
         Err(e) => {
@@ -437,15 +585,54 @@ async fn run_connection<S>(
     stream: NoiseStream<S>,
     peer_id: PeerId,
     remote_static: [u8; 32],
+    ack_tx: mpsc::Sender<Frame>,
     mut send_rx: mpsc::Receiver<Frame>,
     msg_tx: mpsc::Sender<AppMsg>,
     connections: Connections,
+    queue: SharedQueue,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    // Deliver anything queued for this peer while they were offline. Runs as
+    // its own task so the writer loop below drains the channel concurrently; a
+    // backlog larger than the channel buffer would otherwise deadlock.
+    {
+        let flush_ack = ack_tx.clone();
+        let flush_queue = queue.clone();
+        let flush_msg_tx = msg_tx.clone();
+        tokio::spawn(async move {
+            let hex = hex32(&remote_static);
+            let pending = {
+                let guard = flush_queue.lock().await;
+                guard.as_ref().and_then(|q| q.load(&hex).ok())
+            };
+            if let Some(msgs) = pending {
+                for m in msgs {
+                    if flush_ack
+                        .send(Frame::Msg {
+                            id: m.id,
+                            text: m.text,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    let _ = flush_msg_tx
+                        .send(AppMsg::DeliveryUpdate {
+                            id: m.id,
+                            status: DeliveryStatus::Sent,
+                        })
+                        .await;
+                }
+            }
+        });
+    }
+
     let (mut reader, mut writer) = stream.split();
 
     let read_msg_tx = msg_tx.clone();
+    let ack_queue = queue.clone();
     let read_task = tokio::spawn(async move {
         loop {
             match reader.recv().await {
@@ -456,6 +643,42 @@ async fn run_connection<S>(
                                 from_peer_id: peer_id,
                                 remote_static,
                                 text,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Ok(Frame::Msg { id, text }) => {
+                        // Acknowledge receipt so the sender can mark it
+                        // delivered and drop its queued copy, then surface it.
+                        let _ = ack_tx.send(Frame::Ack(id)).await;
+                        if read_msg_tx
+                            .send(AppMsg::MessageReceived {
+                                from_peer_id: peer_id,
+                                remote_static,
+                                text,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Ok(Frame::Ack(id)) => {
+                        // The peer has it: drop our queued copy.
+                        {
+                            let hex = hex32(&remote_static);
+                            let guard = ack_queue.lock().await;
+                            if let Some(q) = guard.as_ref() {
+                                let _ = q.remove(&hex, id);
+                            }
+                        }
+                        if read_msg_tx
+                            .send(AppMsg::DeliveryUpdate {
+                                id,
+                                status: DeliveryStatus::Delivered,
                             })
                             .await
                             .is_err()
@@ -505,6 +728,15 @@ fn capture_remote_static<S>(stream: &NoiseStream<S>) -> Result<[u8; 32], noise::
     let mut out = [0u8; 32];
     out.copy_from_slice(bytes);
     Ok(out)
+}
+
+fn hex32(bytes: &[u8; 32]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(64);
+    for b in bytes {
+        let _ = write!(&mut s, "{b:02x}");
+    }
+    s
 }
 
 fn decode_peer_id(bytes: &[u8]) -> Result<PeerId, noise::NoiseError> {

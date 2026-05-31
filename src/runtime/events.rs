@@ -31,6 +31,16 @@ pub enum AppMsg {
         peer_id: PeerId,
         remote_static: [u8; 32],
     },
+    DeliveryUpdate {
+        id: u64,
+        status: DeliveryStatus,
+    },
+    /// A queue vault file exists on disk; the user must unlock it to resume.
+    VaultLocked,
+    /// The vault is set up or unlocked; the offline queue is now usable.
+    VaultReady,
+    /// Vault setup or unlock failed (wrong passphrase, i/o, etc.).
+    VaultFailed(String),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -48,11 +58,48 @@ impl Role {
     }
 }
 
+/// How far an outgoing message has progressed. The TUI renders this next to
+/// each message you send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryStatus {
+    Sending,
+    Queued,
+    Sent,
+    Delivered,
+    Failed,
+}
+
+impl DeliveryStatus {
+    pub fn marker(self) -> &'static str {
+        match self {
+            DeliveryStatus::Sending => "sending…",
+            DeliveryStatus::Queued => "queued",
+            DeliveryStatus::Sent => "sent",
+            DeliveryStatus::Delivered => "delivered ✓",
+            DeliveryStatus::Failed => "failed ✗",
+        }
+    }
+}
+
+/// A user passphrase. Debug is redacted so it never lands in a log line.
+#[derive(Clone)]
+pub struct Passphrase(pub String);
+
+impl std::fmt::Debug for Passphrase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Passphrase(<redacted>)")
+    }
+}
+
 #[derive(Debug)]
 pub enum TransportCmd {
     Shutdown,
     ConnectOnion(String),
-    SendMessage { remote_static: [u8; 32], text: String },
+    SendMessage { remote_static: [u8; 32], id: u64, text: String },
+    /// Create a brand new queue vault from this passphrase (first time setup).
+    SetupVault(Passphrase),
+    /// Unlock an existing queue vault.
+    UnlockVault(Passphrase),
 }
 
 #[derive(Debug, Clone, Copy)]
