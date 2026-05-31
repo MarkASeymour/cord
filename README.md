@@ -34,7 +34,7 @@ To run two instances side by side for local testing, give each its own config di
 
 ## Using the TUI
 
-The screen has four regions: a status bar, the chat log, your input line, and a key hint footer.
+The screen has five regions: a status bar, the conversation pane, a system log pane (connection and diagnostic messages, kept separate so they do not crowd out your chat), your input line, and a key hint footer. Both panes follow the newest line by default. To read back through history, press Tab to choose which pane to scroll (its header turns bold), then PgUp and PgDn to move through it; the pane stays put as new lines arrive below. End returns it to following the newest line.
 
 Type `/help` and press Enter to list every command. Quick reference:
 
@@ -49,6 +49,7 @@ Type `/help` and press Enter to list every command. Quick reference:
 - `/passphrase` set a passphrase to enable the encrypted offline queue.
 - `/unlock` unlock the offline queue for the current session.
 - `/quit` exit.
+- Tab choose which pane scrolls; PgUp / PgDn scroll it; Home / End jump to the top / newest line.
 - Esc or Ctrl C exit.
 - Enter submit.
 

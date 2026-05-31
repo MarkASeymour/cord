@@ -161,6 +161,26 @@ fn handle_key(
             app.input_buffer.push(c);
             None
         }
+        KeyCode::Tab => {
+            app.toggle_focus();
+            None
+        }
+        KeyCode::PageUp => {
+            app.focused_view().page_up();
+            None
+        }
+        KeyCode::PageDown => {
+            app.focused_view().page_down();
+            None
+        }
+        KeyCode::Home => {
+            app.focused_view().to_top();
+            None
+        }
+        KeyCode::End => {
+            app.focused_view().to_bottom();
+            None
+        }
         _ => None,
     }
 }

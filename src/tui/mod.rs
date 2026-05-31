@@ -28,6 +28,7 @@ pub mod layout;
 pub mod view;
 
 const CHAT_LOG_CAP: usize = 500;
+const SYSTEM_LOG_CAP: usize = 500;
 
 pub struct App {
     pub identity: Identity,
@@ -35,11 +36,15 @@ pub struct App {
     pub peers: HashMap<PeerId, KnownPeer>,
     pub contacts: Vec<Contact>,
     pub chat_log: VecDeque<ChatEntry>,
+    pub system_log: VecDeque<String>,
     pub input_buffer: String,
     pub mode: InputMode,
     pub vault_ready: bool,
     pub vault_locked: bool,
     pub connected: HashSet<[u8; 32]>,
+    pub focus: Pane,
+    pub chat_view: PaneView,
+    pub log_view: PaneView,
     pub should_quit: bool,
 }
 
@@ -62,7 +67,6 @@ pub enum TransportState {
 }
 
 pub enum ChatEntry {
-    System(String),
     Incoming { from: String, text: String },
     Outgoing {
         to: String,
@@ -70,6 +74,71 @@ pub enum ChatEntry {
         id: u64,
         status: DeliveryStatus,
     },
+}
+
+/// The two scrollable panes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Pane {
+    Conversation,
+    SystemLog,
+}
+
+/// Scroll state for one pane. `offset` is the absolute row the pane is scrolled
+/// to; `None` means follow the newest line (pinned to the bottom). `max` and
+/// `page` are cached from the last render so the input handler can page and
+/// clamp without recomputing the wrapped layout. Holding an absolute offset
+/// (rather than a distance from the bottom) keeps the view anchored to the same
+/// lines as new content arrives below.
+pub struct PaneView {
+    pub offset: Option<u16>,
+    pub max: u16,
+    pub page: u16,
+}
+
+impl PaneView {
+    fn new() -> Self {
+        Self {
+            offset: None,
+            max: 0,
+            page: 1,
+        }
+    }
+
+    /// Row to scroll to this frame, given the freshly computed maximum.
+    pub fn resolve(&self, max: u16) -> u16 {
+        match self.offset {
+            None => max,
+            Some(y) => y.min(max),
+        }
+    }
+
+    /// True when the pane is held above the newest line.
+    pub fn is_scrolled(&self) -> bool {
+        self.offset.is_some_and(|y| y < self.max)
+    }
+
+    pub fn page_up(&mut self) {
+        let cur = self.offset.unwrap_or(self.max);
+        self.offset = Some(cur.saturating_sub(self.page.max(1)));
+    }
+
+    pub fn page_down(&mut self) {
+        let cur = self.offset.unwrap_or(self.max);
+        let next = cur.saturating_add(self.page.max(1));
+        if next >= self.max {
+            self.offset = None; // reaching the bottom resumes following
+        } else {
+            self.offset = Some(next);
+        }
+    }
+
+    pub fn to_top(&mut self) {
+        self.offset = Some(0);
+    }
+
+    pub fn to_bottom(&mut self) {
+        self.offset = None;
+    }
 }
 
 /// Whether keystrokes go to the chat input line or to a masked passphrase
@@ -146,54 +215,53 @@ impl PassphrasePrompt {
 
 impl App {
     pub fn new(identity: Identity) -> Self {
-        let mut chat_log = VecDeque::with_capacity(CHAT_LOG_CAP);
-        chat_log.push_back(ChatEntry::System("welcome to cord".to_string()));
+        let mut system_log: VecDeque<String> = VecDeque::with_capacity(SYSTEM_LOG_CAP);
+        system_log.push_back("welcome to cord".to_string());
         if identity.freshly_generated {
-            chat_log.push_back(ChatEntry::System(format!(
+            system_log.push_back(format!(
                 "identity generated at {}",
                 identity.config_dir.display()
-            )));
-            chat_log.push_back(ChatEntry::System(format!(
+            ));
+            system_log.push_back(format!(
                 "peer-id (full): {}. keep the config directory safe.",
                 identity.peer_id
-            )));
+            ));
         } else {
-            chat_log.push_back(ChatEntry::System(format!(
+            system_log.push_back(format!(
                 "identity loaded from {}",
                 identity.config_dir.display()
-            )));
+            ));
         }
 
         let contacts = match contacts::load(&identity.config_dir) {
             Ok(list) => {
                 if !list.is_empty() {
-                    chat_log.push_back(ChatEntry::System(format!(
-                        "loaded {} contact(s) from disk",
-                        list.len()
-                    )));
+                    system_log.push_back(format!("loaded {} contact(s) from disk", list.len()));
                 }
                 list
             }
             Err(e) => {
-                chat_log.push_back(ChatEntry::System(format!("contacts: load failed: {e}")));
+                system_log.push_back(format!("contacts: load failed: {e}"));
                 Vec::new()
             }
         };
 
-        chat_log.push_back(ChatEntry::System(
-            "ready. type /help for commands. Esc to quit.".to_string(),
-        ));
+        system_log.push_back("ready. type /help for commands. Esc to quit.".to_string());
         Self {
             identity,
             transport_state: TransportState::Bootstrapping,
             peers: HashMap::new(),
             contacts,
-            chat_log,
+            chat_log: VecDeque::with_capacity(CHAT_LOG_CAP),
+            system_log,
             input_buffer: String::new(),
             mode: InputMode::Normal,
             vault_ready: false,
             vault_locked: false,
             connected: HashSet::new(),
+            focus: Pane::Conversation,
+            chat_view: PaneView::new(),
+            log_view: PaneView::new(),
             should_quit: false,
         }
     }
@@ -355,7 +423,10 @@ impl App {
     }
 
     pub fn push_system(&mut self, line: impl Into<String>) {
-        self.push_entry(ChatEntry::System(line.into()));
+        if self.system_log.len() == SYSTEM_LOG_CAP {
+            self.system_log.pop_front();
+        }
+        self.system_log.push_back(line.into());
     }
 
     pub fn push_incoming(&mut self, from: String, text: String) {
@@ -566,6 +637,20 @@ impl App {
         self.mode = InputMode::Passphrase(PassphrasePrompt::new(PassphrasePurpose::Unlock));
     }
 
+    pub fn toggle_focus(&mut self) {
+        self.focus = match self.focus {
+            Pane::Conversation => Pane::SystemLog,
+            Pane::SystemLog => Pane::Conversation,
+        };
+    }
+
+    pub fn focused_view(&mut self) -> &mut PaneView {
+        match self.focus {
+            Pane::Conversation => &mut self.chat_view,
+            Pane::SystemLog => &mut self.log_view,
+        }
+    }
+
     pub fn resolve_contact_onion(&self, query: &str) -> Result<String, String> {
         let matches: Vec<&Contact> = self
             .contacts
@@ -678,7 +763,7 @@ async fn run_loop(
     let mut ticker = interval(Duration::from_millis(50));
 
     loop {
-        terminal.draw(|f| view::render(f, &app))?;
+        terminal.draw(|f| view::render(f, &mut app))?;
         if app.should_quit {
             return Ok(());
         }
