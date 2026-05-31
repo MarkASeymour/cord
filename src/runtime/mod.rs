@@ -633,7 +633,7 @@ async fn run_connection<S>(
 
     let read_msg_tx = msg_tx.clone();
     let ack_queue = queue.clone();
-    let read_task = tokio::spawn(async move {
+    let mut read_task = tokio::spawn(async move {
         loop {
             match reader.recv().await {
                 Ok(bytes) => match Frame::decode(&bytes) {
@@ -698,10 +698,23 @@ async fn run_connection<S>(
         }
     });
 
-    while let Some(frame) = send_rx.recv().await {
-        if let Err(e) = writer.send(&frame.encode()).await {
-            let _ = msg_tx.send(AppMsg::Log(format!("send: {e}"))).await;
-            break;
+    // Pump outgoing frames, but also stop the instant the read task ends. The
+    // read task ends when the peer closes its side, so this tears the
+    // connection down promptly instead of waiting for a future write to fail.
+    // Without it the registry keeps a dead entry and the sender keeps routing
+    // new messages to a connection that is already gone.
+    loop {
+        tokio::select! {
+            maybe_frame = send_rx.recv() => match maybe_frame {
+                Some(frame) => {
+                    if let Err(e) = writer.send(&frame.encode()).await {
+                        let _ = msg_tx.send(AppMsg::Log(format!("send: {e}"))).await;
+                        break;
+                    }
+                }
+                None => break,
+            },
+            _ = &mut read_task => break,
         }
     }
 
@@ -750,4 +763,78 @@ fn decode_peer_id(bytes: &[u8]) -> Result<PeerId, noise::NoiseError> {
     let mut id_bytes = [0u8; PeerId::BYTE_LEN];
     id_bytes.copy_from_slice(bytes);
     Ok(PeerId::from_bytes(id_bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::noise::StaticKey;
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    // When the peer closes its side, run_connection must tear the connection
+    // down promptly (drop it from the registry, emit PeerDisconnected) even
+    // when no outgoing write is in flight. Otherwise the sender keeps treating
+    // the dead peer as connected and a later message is lost instead of queued.
+    #[tokio::test]
+    async fn dropped_peer_tears_down_connection_promptly() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let key_a = StaticKey::generate().unwrap();
+        let key_b = StaticKey::generate().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            noise::handshake_responder(sock, &key_b).await.unwrap()
+        });
+        let client_sock = TcpStream::connect(addr).await.unwrap();
+        let client = noise::handshake_initiator(client_sock, &key_a).await.unwrap();
+        let peer_stream = server.await.unwrap();
+
+        let (msg_tx, mut msg_rx) = mpsc::channel(16);
+        let (send_tx, send_rx) = mpsc::channel(8);
+        let connections: Connections = Arc::new(Mutex::new(HashMap::new()));
+        let queue: SharedQueue = Arc::new(Mutex::new(None));
+        let remote_static = [7u8; 32];
+        connections
+            .lock()
+            .await
+            .insert(remote_static, send_tx.clone());
+
+        tokio::spawn(run_connection(
+            client,
+            PeerId::generate(),
+            remote_static,
+            send_tx.clone(),
+            send_rx,
+            msg_tx,
+            connections.clone(),
+            queue,
+        ));
+
+        // Hold a sender open so the connection can only end via the read side.
+        let _keep_alive = send_tx;
+
+        // The peer goes away.
+        drop(peer_stream);
+
+        let torn_down = timeout(Duration::from_secs(2), async {
+            while let Some(msg) = msg_rx.recv().await {
+                if matches!(msg, AppMsg::PeerDisconnected { .. }) {
+                    return true;
+                }
+            }
+            false
+        })
+        .await;
+
+        assert!(
+            matches!(torn_down, Ok(true)),
+            "peer dropped but no PeerDisconnected was emitted: teardown was not prompt"
+        );
+        assert!(
+            connections.lock().await.is_empty(),
+            "dead connection was not removed from the registry"
+        );
+    }
 }

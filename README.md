@@ -116,7 +116,7 @@ The status bar shows the queue state: `off` (no passphrase set yet), `locked` (s
 Limits in this version:
 
 - Delivery is at least once. If a connection drops after the peer received a message but before its acknowledgement reached you, the message is resent on the next connect and the peer may see it twice.
-- A message sent over a live connection that is never acknowledged (the peer dropped right after connecting) is not queued and is not retried.
+- A message sent in the brief moment before a silent disconnect is noticed can still be lost. cord tears a connection down as soon as the peer closes it, so this window is small; but a peer that vanishes without closing the connection (a yanked network cable) is not noticed until the next write fails.
 - cord does not yet dial offline contacts on its own to flush the queue. Delivery happens the next time a connection forms through LAN discovery or `/connect`. Automatic background retry is the next milestone.
 
 ## Tests
