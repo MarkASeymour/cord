@@ -152,6 +152,25 @@ impl Queue {
     }
 }
 
+/// Delete every queued message for every contact. Removing the files needs no
+/// vault, so the queue can be cleared even while it is locked. Returns the
+/// number of per contact queue files removed.
+pub fn clear(config_dir: &Path) -> Result<usize, QueueError> {
+    let dir = config_dir.join(QUEUE_DIR);
+    if !dir.exists() {
+        return Ok(0);
+    }
+    let mut removed = 0;
+    for entry in fs::read_dir(&dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_file() {
+            fs::remove_file(entry.path())?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
 fn encode_messages(msgs: &[QueuedMessage]) -> Vec<u8> {
     let mut out = Vec::new();
     for m in msgs {
@@ -275,5 +294,24 @@ mod tests {
         q.remove(&c, 999).unwrap();
         assert_eq!(q.load(&c).unwrap().len(), 1);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn clear_removes_every_queue() {
+        let (dir, q) = temp_queue();
+        q.enqueue(&hex(0x01), QueuedMessage { id: 1, text: "a".into() }).unwrap();
+        q.enqueue(&hex(0x02), QueuedMessage { id: 2, text: "b".into() }).unwrap();
+        assert_eq!(q.contacts_with_pending().unwrap().len(), 2);
+
+        let removed = clear(&dir).unwrap();
+        assert_eq!(removed, 2);
+        assert!(q.contacts_with_pending().unwrap().is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn clear_with_no_queue_dir_is_zero() {
+        let dir = std::env::temp_dir().join(format!("cord-queue-{:x}", rand::random::<u64>()));
+        assert_eq!(clear(&dir).unwrap(), 0);
     }
 }

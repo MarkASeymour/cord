@@ -291,6 +291,9 @@ fn submit(app: &mut App, cmd_tx: &mpsc::Sender<TransportCmd>) -> Option<Transpor
         app.begin_passphrase_unlock();
         return None;
     }
+    if text == "/clearqueue" {
+        return Some(TransportCmd::ClearQueue);
+    }
     if text == "/quit" || text == "/q" {
         app.should_quit = true;
         return None;
@@ -315,6 +318,7 @@ fn show_help(app: &mut App) {
     app.push_system("  /connect <name-or-hex>  dial a verified contact (or a raw .onion address)");
     app.push_system("  /passphrase          set a passphrase to enable the encrypted offline queue");
     app.push_system("  /unlock              unlock the offline queue for this session");
+    app.push_system("  /clearqueue          discard all queued (undelivered) messages");
     app.push_system("  /help, /?            show this");
     app.push_system("  /quit, /q            exit");
     app.push_system("keys:");

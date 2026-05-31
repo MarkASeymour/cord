@@ -163,6 +163,18 @@ pub async fn spawn(
                         }
                     }
                 }
+                TransportCmd::ClearQueue => {
+                    match crate::messaging::queue::clear(&route_config_dir) {
+                        Ok(count) => {
+                            let _ = route_msg_tx.send(AppMsg::QueueCleared { count }).await;
+                        }
+                        Err(e) => {
+                            let _ = route_msg_tx
+                                .send(AppMsg::Log(format!("clear queue failed: {e}")))
+                                .await;
+                        }
+                    }
+                }
                 TransportCmd::SendMessage { remote_static, id, text } => {
                     let sender = {
                         let guard = route_connections.lock().await;

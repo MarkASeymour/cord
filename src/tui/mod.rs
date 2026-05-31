@@ -601,6 +601,23 @@ impl App {
                     self.push_system(format!("vault: {msg}"));
                 }
             }
+            AppMsg::QueueCleared { count } => {
+                // Anything still showing as queued will not be delivered now.
+                for entry in self.chat_log.iter_mut() {
+                    if let ChatEntry::Outgoing { status, .. } = entry {
+                        if *status == DeliveryStatus::Queued {
+                            *status = DeliveryStatus::Dropped;
+                        }
+                    }
+                }
+                if count == 0 {
+                    self.push_system("message queue is already empty");
+                } else {
+                    self.push_system(format!(
+                        "cleared the message queue ({count} contact(s) had pending messages)"
+                    ));
+                }
+            }
         }
     }
 

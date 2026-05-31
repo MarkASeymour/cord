@@ -41,6 +41,8 @@ pub enum AppMsg {
     VaultReady,
     /// Vault setup or unlock failed (wrong passphrase, i/o, etc.).
     VaultFailed(String),
+    /// The message queue was cleared; `count` per contact queues were removed.
+    QueueCleared { count: usize },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -67,6 +69,7 @@ pub enum DeliveryStatus {
     Sent,
     Delivered,
     Failed,
+    Dropped,
 }
 
 impl DeliveryStatus {
@@ -77,6 +80,7 @@ impl DeliveryStatus {
             DeliveryStatus::Sent => "sent",
             DeliveryStatus::Delivered => "delivered ✓",
             DeliveryStatus::Failed => "failed ✗",
+            DeliveryStatus::Dropped => "dropped",
         }
     }
 }
@@ -100,6 +104,8 @@ pub enum TransportCmd {
     SetupVault(Passphrase),
     /// Unlock an existing queue vault.
     UnlockVault(Passphrase),
+    /// Delete every queued (undelivered) message. Does not need the vault.
+    ClearQueue,
 }
 
 #[derive(Debug, Clone, Copy)]

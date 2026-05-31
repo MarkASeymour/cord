@@ -48,6 +48,7 @@ Type `/help` and press Enter to list every command. Quick reference:
 - `/connect <name-or-hex>` dial a verified contact over Tor (or paste a raw `.onion` address for a debug connection).
 - `/passphrase` set a passphrase to enable the encrypted offline queue.
 - `/unlock` unlock the offline queue for the current session.
+- `/clearqueue` discard all queued (undelivered) messages, even while the queue is locked.
 - `/quit` exit.
 - Tab choose which pane scrolls; PgUp / PgDn scroll it; Home / End jump to the top / newest line.
 - Esc or Ctrl C exit.
@@ -113,6 +114,8 @@ On a later run, if a queue already exists cord prompts you to unlock it so pendi
     /unlock
 
 The status bar shows the queue state: `off` (no passphrase set yet), `locked` (set but not unlocked this run), or `on` (unlocked and ready). If you forget the passphrase the queued messages cannot be recovered; delete `<config_dir>/queue.key` and the `<config_dir>/queue/` directory to start fresh.
+
+To discard everything waiting in the queue, run `/clearqueue`. It deletes the queued messages without reading them, so it works even when the queue is locked. Any messages still shown as `queued` flip to `dropped`.
 
 Limits in this version:
 
