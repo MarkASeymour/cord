@@ -21,7 +21,7 @@ use crate::contacts::{self, Contact, ContactBlob, ContactStatus};
 use crate::discovery::KnownPeer;
 use crate::errors::CordError;
 use crate::identity::{Identity, PeerId};
-use crate::runtime::events::{AppMsg, DeliveryStatus, LocalAddrs, TransportCmd};
+use crate::runtime::events::{AppMsg, ContactRoute, DeliveryStatus, LocalAddrs, TransportCmd};
 
 pub mod input;
 pub mod layout;
@@ -35,6 +35,7 @@ pub struct App {
     pub transport_state: TransportState,
     pub peers: HashMap<PeerId, KnownPeer>,
     pub contacts: Vec<Contact>,
+    pub contacts_dirty: bool,
     pub chat_log: VecDeque<ChatEntry>,
     pub system_log: VecDeque<String>,
     pub input_buffer: String,
@@ -252,6 +253,7 @@ impl App {
             transport_state: TransportState::Bootstrapping,
             peers: HashMap::new(),
             contacts,
+            contacts_dirty: false,
             chat_log: VecDeque::with_capacity(CHAT_LOG_CAP),
             system_log,
             input_buffer: String::new(),
@@ -335,6 +337,7 @@ impl App {
                 if let Err(e) = contacts::save(&self.identity.config_dir, &self.contacts) {
                     self.push_system(format!("contacts: save failed: {e}"));
                 }
+                self.contacts_dirty = true;
                 self.push_system(format!("removed contact: {}", removed.short_label()));
             }
             _ => self.push_system(format!(
@@ -383,12 +386,26 @@ impl App {
                 if let Err(e) = contacts::save(&self.identity.config_dir, &self.contacts) {
                     self.push_system(format!("contacts: save failed: {e}"));
                 }
+                self.contacts_dirty = true;
                 self.push_system(format!("{verb} contact: {label}"));
             }
             _ => self.push_system(format!(
                 "multiple contacts match {query:?}. use a more specific name or longer hex prefix."
             )),
         }
+    }
+
+    /// Verified contacts as routes for the runtime's retry loop.
+    pub fn verified_routes(&self) -> Vec<ContactRoute> {
+        self.contacts
+            .iter()
+            .filter(|c| c.status == ContactStatus::Verified)
+            .map(|c| ContactRoute {
+                remote_static: c.blob.noise_static_pub,
+                hs_id: c.blob.hs_id,
+                label: c.short_label(),
+            })
+            .collect()
     }
 
     pub fn list_contacts(&mut self) {
@@ -779,6 +796,11 @@ async fn run_loop(
     let mut events = EventStream::new();
     let mut ticker = interval(Duration::from_millis(50));
 
+    // initial route sync
+    let _ = cmd_tx
+        .send(TransportCmd::SyncContacts(app.verified_routes()))
+        .await;
+
     loop {
         terminal.draw(|f| view::render(f, &mut app))?;
         if app.should_quit {
@@ -790,6 +812,13 @@ async fn run_loop(
                     Ok(event) => {
                         if let Some(cmd) = input::handle(&mut app, event, cmd_tx) {
                             let _ = cmd_tx.send(cmd).await;
+                        }
+                        // re-sync if the command changed the verified set
+                        if app.contacts_dirty {
+                            app.contacts_dirty = false;
+                            let _ = cmd_tx
+                                .send(TransportCmd::SyncContacts(app.verified_routes()))
+                                .await;
                         }
                     }
                     Err(e) => return Err(e.into()),

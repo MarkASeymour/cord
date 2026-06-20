@@ -106,6 +106,18 @@ pub enum TransportCmd {
     UnlockVault(Passphrase),
     /// Delete every queued (undelivered) message. Does not need the vault.
     ClearQueue,
+    /// Replace the verified contacts the retry loop may dial. Sent by the TUI
+    /// at startup and whenever the contact list changes.
+    SyncContacts(Vec<ContactRoute>),
+}
+
+/// A verified contact the retry loop can reach: its Noise static key and the raw
+/// v3 onion key bytes (kept raw so the TUI stays free of arti types).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContactRoute {
+    pub remote_static: [u8; 32],
+    pub hs_id: [u8; 32],
+    pub label: String,
 }
 
 #[derive(Debug, Clone, Copy)]

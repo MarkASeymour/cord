@@ -101,7 +101,9 @@ If you `/msg` a verified contact who is not connected right now, cord asks wheth
 
     alice is offline. queue "your message" for delivery on reconnect? (y / n)
 
-Press `y` to hold it in an encrypted on disk queue. It shows as `queued`, and on the next connection to that contact it is resent, acknowledged, and flipped to `delivered ✓`. Press `n` or Esc to discard the message; it is never sent or stored.
+Press `y` to hold it in an encrypted on disk queue. It shows as `queued`, and the next time cord connects to that contact it is resent, acknowledged, and flipped to `delivered ✓`. Press `n` or Esc to discard the message; it is never sent or stored.
+
+You do not have to reconnect by hand. While the queue holds anything for an offline contact, cord quietly tries that contact's onion address on its own, on a jittered timer that starts at 45 to 90 seconds and widens the longer they stay offline. It dials only contacts that have messages waiting, never to check who is online, and the attempts are invisible: nothing prints unless a message actually goes through. When the contact comes back, the queue flushes and the markers flip to `delivered ✓`. A LAN connection or a manual `/connect` still flushes the queue too.
 
 The queue is encrypted at rest with a passphrase you choose, because it is the only place your message content ever touches disk. Before cord will queue anything, set a passphrase once:
 
@@ -121,7 +123,7 @@ Limits in this version:
 
 - Delivery is at least once. If a connection drops after the peer received a message but before its acknowledgement reached you, the message is resent on the next connect and the peer may see it twice.
 - A message sent in the brief moment before a silent disconnect is noticed can still be lost. cord tears a connection down as soon as the peer closes it, so this window is small; but a peer that vanishes without closing the connection (a yanked network cable) is not noticed until the next write fails.
-- cord does not yet dial offline contacts on its own to flush the queue. Delivery happens the next time a connection forms through LAN discovery or `/connect`. Automatic background retry is the next milestone.
+- The background retry runs on a timer; it does not yet notice the instant your network comes back, so after you regain connectivity a queued message can wait out the rest of its current interval (at most about a minute and a half on the first attempt) before the next attempt. A manual `/connect` delivers immediately if you do not want to wait.
 
 ## Tests
 

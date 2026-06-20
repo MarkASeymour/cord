@@ -24,15 +24,18 @@ use crate::noise::{self, NoiseStream, StaticKey};
 use crate::transport::lan::LanTransport;
 use crate::transport::onion::{self, OnionLaunch};
 
-use self::events::{AppMsg, DeliveryStatus, LocalAddrs, Role, TransportCmd};
+use self::events::{AppMsg, ContactRoute, DeliveryStatus, LocalAddrs, Role, TransportCmd};
 
 pub mod events;
+mod retry;
 
 const ONION_PORT: u16 = 1;
 const CONNECTION_QUEUE: usize = 32;
 
 type Connections = Arc<Mutex<HashMap<[u8; 32], mpsc::Sender<Frame>>>>;
 type SharedQueue = Arc<Mutex<Option<Queue>>>;
+/// Verified contacts the retry loop may poll, synced from the TUI.
+type SharedRoutes = Arc<Mutex<Vec<ContactRoute>>>;
 
 pub struct TransportTask {
     pub handle: JoinHandle<()>,
@@ -52,6 +55,8 @@ pub async fn spawn(
 
     let connections: Connections = Arc::new(Mutex::new(HashMap::new()));
     let queue: SharedQueue = Arc::new(Mutex::new(None));
+    let routes: SharedRoutes = Arc::new(Mutex::new(Vec::new()));
+    let (retry_kick_tx, retry_kick_rx) = mpsc::channel::<()>(8);
 
     let (peer_event_tx, peer_event_rx) = mpsc::channel(64);
     let mdns_handle = mdns::start(peer_id, local.port(), peer_event_tx)?;
@@ -93,12 +98,16 @@ pub async fn spawn(
         onion_connect_rx,
         connections.clone(),
         queue.clone(),
+        routes.clone(),
+        retry_kick_rx,
     );
 
     let route_msg_tx = msg_tx.clone();
     let route_connections = connections.clone();
     let route_queue = queue.clone();
     let route_config_dir = config_dir.clone();
+    let route_routes = routes.clone();
+    let route_kick_tx = retry_kick_tx.clone();
     let handle = tokio::spawn(async move {
         let mut mdns_handle = Some(mdns_handle);
         while let Some(cmd) = cmd_rx.recv().await {
@@ -147,6 +156,8 @@ pub async fn spawn(
                                 *route_queue.lock().await =
                                     Some(Queue::new(&route_config_dir, Arc::new(vault)));
                                 let _ = route_msg_tx.send(AppMsg::VaultReady).await;
+                                // unlocked: a prior backlog is now readable
+                                let _ = route_kick_tx.try_send(());
                             }
                             Err(e) => {
                                 let _ = route_msg_tx
@@ -174,6 +185,11 @@ pub async fn spawn(
                                 .await;
                         }
                     }
+                }
+                TransportCmd::SyncContacts(new_routes) => {
+                    *route_routes.lock().await = new_routes;
+                    // a new route may match an existing backlog
+                    let _ = route_kick_tx.try_send(());
                 }
                 TransportCmd::SendMessage { remote_static, id, text } => {
                     let sender = {
@@ -224,6 +240,8 @@ pub async fn spawn(
                                                 .into(),
                                         ))
                                         .await;
+                                    // freshly queued: poll now, not next window
+                                    let _ = route_kick_tx.try_send(());
                                 }
                                 Some(Err(e)) => {
                                     let _ = route_msg_tx
@@ -353,6 +371,7 @@ fn spawn_discovery_loop(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_onion(
     config_dir: PathBuf,
     msg_tx: mpsc::Sender<AppMsg>,
@@ -361,6 +380,8 @@ fn spawn_onion(
     mut connect_rx: mpsc::Receiver<String>,
     connections: Connections,
     queue: SharedQueue,
+    routes: SharedRoutes,
+    retry_kick_rx: mpsc::Receiver<()>,
 ) {
     tokio::spawn(async move {
         let _ = msg_tx
@@ -388,6 +409,18 @@ fn spawn_onion(
             })
             .await;
 
+        // Tor is up: the retry loop can dial onions now.
+        retry::spawn(
+            tor_client.clone(),
+            routes,
+            retry_kick_rx,
+            static_key.clone(),
+            own_id,
+            msg_tx.clone(),
+            connections.clone(),
+            queue.clone(),
+        );
+
         let mut stream_requests = Box::pin(handle_rend_requests(rend_requests));
 
         loop {
@@ -410,7 +443,7 @@ fn spawn_onion(
                     let connections = connections.clone();
                     let queue = queue.clone();
                     tokio::spawn(async move {
-                        connect_onion_peer(client, addr_str, static_key, own_id, msg_tx, connections, queue).await;
+                        connect_onion_peer(client, addr_str, static_key, own_id, msg_tx, connections, queue, false).await;
                     });
                 }
                 else => break,
@@ -516,6 +549,9 @@ async fn accept_onion_stream(
     handle_handshake_result(result, Role::Responder, None, msg_tx, connections, queue).await;
 }
 
+/// Dial a peer's onion and handshake as initiator. `quiet` (the retry loop)
+/// suppresses the connecting log and failure reporting; only success surfaces.
+#[allow(clippy::too_many_arguments)]
 async fn connect_onion_peer(
     client: TorClient<PreferredRuntime>,
     onion_addr: String,
@@ -524,11 +560,14 @@ async fn connect_onion_peer(
     msg_tx: mpsc::Sender<AppMsg>,
     connections: Connections,
     queue: SharedQueue,
+    quiet: bool,
 ) {
     let trimmed = onion_addr.trim().to_string();
-    let _ = msg_tx
-        .send(AppMsg::Log(format!("onion: connecting to {trimmed}…")))
-        .await;
+    if !quiet {
+        let _ = msg_tx
+            .send(AppMsg::Log(format!("onion: connecting to {trimmed}…")))
+            .await;
+    }
     let result = async {
         let data_stream = client
             .connect((trimmed.as_str(), ONION_PORT))
@@ -545,7 +584,23 @@ async fn connect_onion_peer(
     }
     .await;
 
-    handle_handshake_result(result, Role::Initiator, None, msg_tx, connections, queue).await;
+    if quiet {
+        if let Ok((stream, peer_id, sas, remote_static)) = result {
+            spawn_established_connection(
+                stream,
+                peer_id,
+                sas,
+                remote_static,
+                Role::Initiator,
+                msg_tx,
+                connections,
+                queue,
+            )
+            .await;
+        }
+    } else {
+        handle_handshake_result(result, Role::Initiator, None, msg_tx, connections, queue).await;
+    }
 }
 
 async fn handle_handshake_result<S>(
@@ -560,26 +615,17 @@ async fn handle_handshake_result<S>(
 {
     match result {
         Ok((stream, peer_id, sas, remote_static)) => {
-            let (send_tx, send_rx) = mpsc::channel::<Frame>(CONNECTION_QUEUE);
-            connections.lock().await.insert(remote_static, send_tx.clone());
-            let _ = msg_tx
-                .send(AppMsg::HandshakeOk {
-                    peer_id,
-                    role,
-                    sas,
-                    remote_static,
-                })
-                .await;
-            tokio::spawn(run_connection(
+            spawn_established_connection(
                 stream,
                 peer_id,
+                sas,
                 remote_static,
-                send_tx,
-                send_rx,
+                role,
                 msg_tx,
                 connections,
                 queue,
-            ));
+            )
+            .await;
         }
         Err(e) => {
             let _ = msg_tx
@@ -591,6 +637,43 @@ async fn handle_handshake_result<S>(
                 .await;
         }
     }
+}
+
+/// Register a completed handshake and start its connection task. Shared by
+/// every success path (LAN, onion accept, `/connect`, retry).
+#[allow(clippy::too_many_arguments)]
+async fn spawn_established_connection<S>(
+    stream: NoiseStream<S>,
+    peer_id: PeerId,
+    sas: String,
+    remote_static: [u8; 32],
+    role: Role,
+    msg_tx: mpsc::Sender<AppMsg>,
+    connections: Connections,
+    queue: SharedQueue,
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let (send_tx, send_rx) = mpsc::channel::<Frame>(CONNECTION_QUEUE);
+    connections.lock().await.insert(remote_static, send_tx.clone());
+    let _ = msg_tx
+        .send(AppMsg::HandshakeOk {
+            peer_id,
+            role,
+            sas,
+            remote_static,
+        })
+        .await;
+    tokio::spawn(run_connection(
+        stream,
+        peer_id,
+        remote_static,
+        send_tx,
+        send_rx,
+        msg_tx,
+        connections,
+        queue,
+    ));
 }
 
 async fn run_connection<S>(
