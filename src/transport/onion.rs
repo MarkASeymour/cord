@@ -2,7 +2,8 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use arti_client::{TorClient, TorClientConfig};
+use arti_client::config::TorClientConfigBuilder;
+use arti_client::TorClient;
 use futures::{Stream, StreamExt};
 use safelog::DisplayRedacted;
 use tokio::sync::mpsc;
@@ -24,10 +25,15 @@ pub struct OnionLaunch {
 }
 
 pub async fn launch(
-    _config_dir: PathBuf,
+    config_dir: PathBuf,
     msg_tx: mpsc::Sender<AppMsg>,
 ) -> Result<OnionLaunch, TransportError> {
-    let config = TorClientConfig::default();
+    // separate arti state per config dir, so two instances never share it
+    let state_dir = config_dir.join("arti").join("state");
+    let cache_dir = config_dir.join("arti").join("cache");
+    let config = TorClientConfigBuilder::from_directories(state_dir, cache_dir)
+        .build()
+        .map_err(|e| TransportError::Onion(format!("tor config: {e}")))?;
     let tor_client = TorClient::builder()
         .config(config)
         .create_unbootstrapped()?;

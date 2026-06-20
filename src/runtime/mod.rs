@@ -932,4 +932,112 @@ mod tests {
             "dead connection was not removed from the registry"
         );
     }
+
+    #[tokio::test]
+    async fn both_sides_flush_their_queue_on_connect() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let key_a = StaticKey::generate().unwrap();
+        let key_b = StaticKey::generate().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            noise::handshake_responder(sock, &key_b).await.unwrap()
+        });
+        let client_sock = TcpStream::connect(addr).await.unwrap();
+        let stream_a = noise::handshake_initiator(client_sock, &key_a).await.unwrap();
+        let stream_b = server.await.unwrap();
+
+        // synthetic remote keys: run_connection takes remote_static explicitly
+        let id_a = [1u8; 32];
+        let id_b = [2u8; 32];
+
+        let queue_a = make_queue();
+        let queue_b = make_queue();
+        queue_a
+            .lock()
+            .await
+            .as_ref()
+            .unwrap()
+            .enqueue(&hex32(&id_b), QueuedMessage { id: 10, text: "a to b".into() })
+            .unwrap();
+        queue_b
+            .lock()
+            .await
+            .as_ref()
+            .unwrap()
+            .enqueue(&hex32(&id_a), QueuedMessage { id: 20, text: "b to a".into() })
+            .unwrap();
+
+        let (msg_tx_a, msg_rx_a) = mpsc::channel(32);
+        let (msg_tx_b, msg_rx_b) = mpsc::channel(32);
+        let (send_tx_a, send_rx_a) = mpsc::channel(8);
+        let (send_tx_b, send_rx_b) = mpsc::channel(8);
+        let conns_a: Connections = Arc::new(Mutex::new(HashMap::new()));
+        let conns_b: Connections = Arc::new(Mutex::new(HashMap::new()));
+
+        tokio::spawn(run_connection(
+            stream_a,
+            PeerId::generate(),
+            id_b,
+            send_tx_a.clone(),
+            send_rx_a,
+            msg_tx_a,
+            conns_a,
+            queue_a.clone(),
+        ));
+        tokio::spawn(run_connection(
+            stream_b,
+            PeerId::generate(),
+            id_a,
+            send_tx_b.clone(),
+            send_rx_b,
+            msg_tx_b,
+            conns_b,
+            queue_b.clone(),
+        ));
+
+        let (recv_a, recv_b) = timeout(
+            Duration::from_secs(5),
+            futures::future::join(collect_drain(msg_rx_a), collect_drain(msg_rx_b)),
+        )
+        .await
+        .expect("drain did not complete in time");
+
+        assert_eq!(recv_a, (Some("b to a".to_string()), Some(10)));
+        assert_eq!(recv_b, (Some("a to b".to_string()), Some(20)));
+        assert!(
+            queue_a.lock().await.as_ref().unwrap().load(&hex32(&id_b)).unwrap().is_empty(),
+            "A's queue still holds its message after the ack"
+        );
+        assert!(
+            queue_b.lock().await.as_ref().unwrap().load(&hex32(&id_a)).unwrap().is_empty(),
+            "B's queue still holds its message after the ack"
+        );
+
+        drop((send_tx_a, send_tx_b));
+    }
+
+    fn make_queue() -> SharedQueue {
+        let dir = std::env::temp_dir().join(format!("cord-rt-{:x}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let vault = Arc::new(Vault::create("test passphrase").unwrap().0);
+        Arc::new(Mutex::new(Some(Queue::new(&dir, vault))))
+    }
+
+    async fn collect_drain(mut rx: mpsc::Receiver<AppMsg>) -> (Option<String>, Option<u64>) {
+        let mut incoming = None;
+        let mut delivered = None;
+        while incoming.is_none() || delivered.is_none() {
+            match rx.recv().await {
+                Some(AppMsg::MessageReceived { text, .. }) => incoming = Some(text),
+                Some(AppMsg::DeliveryUpdate { id, status: DeliveryStatus::Delivered }) => {
+                    delivered = Some(id)
+                }
+                Some(_) => {}
+                None => break,
+            }
+        }
+        (incoming, delivered)
+    }
 }

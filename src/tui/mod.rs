@@ -533,34 +533,43 @@ impl App {
             }
             AppMsg::HandshakeOk { peer_id, role, sas, remote_static } => {
                 self.connected.insert(remote_static);
-                self.push_system(format!(
-                    "handshake ok ({}): {}",
-                    role.label(),
-                    peer_id.short()
-                ));
                 let matched: Option<(String, ContactStatus)> = self
                     .contacts
                     .iter()
                     .find(|c| c.blob.noise_static_pub == remote_static)
                     .map(|c| (c.short_label(), c.status));
                 match matched {
+                    // silent receive | a verified peer connecting is
+                    // routine, an internal event only
+                    Some((_, ContactStatus::Verified)) => {}
                     Some((label, ContactStatus::Pending)) => {
+                        self.push_system(format!(
+                            "handshake ok ({}): {}",
+                            role.label(),
+                            peer_id.short()
+                        ));
                         self.push_system(format!("matches pending contact: {label}"));
                         self.push_system(format!(
                             "sas: {sas} (compare aloud, then /verify {label} or /reject {label})"
                         ));
                     }
-                    Some((label, ContactStatus::Verified)) => {
-                        self.push_system(format!("matches verified contact: {label}"));
-                        self.push_system(format!("sas: {sas} (already verified)"));
-                    }
                     Some((label, ContactStatus::Rejected)) => {
+                        self.push_system(format!(
+                            "handshake ok ({}): {}",
+                            role.label(),
+                            peer_id.short()
+                        ));
                         self.push_system(format!(
                             "matches rejected contact: {label}. dropping is recommended."
                         ));
                         self.push_system(format!("sas: {sas}"));
                     }
                     None => {
+                        self.push_system(format!(
+                            "handshake ok ({}): {}",
+                            role.label(),
+                            peer_id.short()
+                        ));
                         self.push_system(
                             "unpaired peer (no matching contact). /pair them first if you trust this connection.".to_string(),
                         );
@@ -587,8 +596,15 @@ impl App {
             }
             AppMsg::PeerDisconnected { remote_static, .. } => {
                 self.connected.remove(&remote_static);
-                let who = self.label_for_remote(&remote_static);
-                self.push_system(format!("disconnected: {who}"));
+                // silent receive: a verified peer dropping must not surface either
+                let verified = self.contacts.iter().any(|c| {
+                    c.blob.noise_static_pub == remote_static
+                        && matches!(c.status, ContactStatus::Verified)
+                });
+                if !verified {
+                    let who = self.label_for_remote(&remote_static);
+                    self.push_system(format!("disconnected: {who}"));
+                }
             }
             AppMsg::DeliveryUpdate { id, status } => self.update_delivery(id, status),
             AppMsg::VaultLocked => {
