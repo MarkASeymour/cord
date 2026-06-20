@@ -38,3 +38,45 @@ async fn split_stream_sends_and_receives_a_text_frame() {
 
     assert_eq!(initiator_got, Frame::Text("echo: hello".into()));
 }
+
+#[tokio::test]
+async fn tracked_message_gets_acked_by_id() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let key_a = StaticKey::generate().unwrap();
+    let key_b = StaticKey::generate().unwrap();
+
+    let responder = tokio::spawn(async move {
+        let (sock, _) = listener.accept().await.unwrap();
+        let stream = noise::handshake_responder(sock, &key_b).await.unwrap();
+        let (mut reader, mut writer) = stream.split();
+        let bytes = reader.recv().await.unwrap();
+        // a receiver acks the exact id it saw
+        if let Frame::Msg { id, .. } = Frame::decode(&bytes).unwrap() {
+            writer.send(&Frame::Ack(id).encode()).await.unwrap();
+        }
+    });
+
+    let initiator = tokio::spawn(async move {
+        let sock = TcpStream::connect(addr).await.unwrap();
+        let stream = noise::handshake_initiator(sock, &key_a).await.unwrap();
+        let (mut reader, mut writer) = stream.split();
+        writer
+            .send(
+                &Frame::Msg {
+                    id: 0xfeed_face,
+                    text: "queued hi".into(),
+                }
+                .encode(),
+            )
+            .await
+            .unwrap();
+        let bytes = reader.recv().await.unwrap();
+        Frame::decode(&bytes).unwrap()
+    });
+
+    let got = initiator.await.unwrap();
+    responder.await.unwrap();
+    assert_eq!(got, Frame::Ack(0xfeed_face));
+}

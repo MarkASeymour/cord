@@ -34,7 +34,7 @@ To run two instances side by side for local testing, give each its own config di
 
 ## Using the TUI
 
-The screen has four regions: a status bar, the chat log, your input line, and a key hint footer.
+The screen has five regions: a status bar, the conversation pane, a system log pane (connection and diagnostic messages, kept separate so they do not crowd out your chat), your input line, and a key hint footer. Both panes follow the newest line by default. To read back through history, press Tab to choose which pane to scroll (its header turns bold), then PgUp and PgDn to move through it; the pane stays put as new lines arrive below. End returns it to following the newest line.
 
 Type `/help` and press Enter to list every command. Quick reference:
 
@@ -46,7 +46,11 @@ Type `/help` and press Enter to list every command. Quick reference:
 - `/unpair <name-or-hex>` remove a contact entirely. Use when you want to start over.
 - `/msg <name> <text>` send a text message to a verified contact.
 - `/connect <name-or-hex>` dial a verified contact over Tor (or paste a raw `.onion` address for a debug connection).
+- `/passphrase` set a passphrase to enable the encrypted offline queue.
+- `/unlock` unlock the offline queue for the current session.
+- `/clearqueue` discard all queued (undelivered) messages, even while the queue is locked.
 - `/quit` exit.
+- Tab choose which pane scrolls; PgUp / PgDn scroll it; Home / End jump to the top / newest line.
 - Esc or Ctrl C exit.
 - Enter submit.
 
@@ -72,16 +76,54 @@ Contacts persist at `<config_dir>/contacts` with 0600 file mode.
 
 ## Messaging
 
-Once two cord users have paired and verified each other, the `/msg` command sends UTF-8 text over the open Noise channel.
+Once two cord users have paired and verified each other, the `/msg` command sends UTF-8 text over the Noise channel.
 
     /msg alice hey, this works
 
 Requirements:
 
 - The contact must be `Verified`. Pending and rejected contacts cannot receive messages.
-- A live connection must already exist. On LAN, that means the peer was auto discovered through mDNS and handshook. Over Tor, that means someone ran `/connect <address>` on at least one side. The recipient must be online at the moment you send. There is no message queue yet; sending to an offline peer fails immediately.
+- On LAN a connection forms automatically once the peer is discovered through mDNS. Over Tor, someone runs `/connect <name-or-hex>` on one side.
 
-Incoming messages appear in the chat log with the sender's name in bold. Outgoing messages echo back dimmed with a `you →` prefix. The full message history persists only in memory for the current session; no on disk history yet.
+Incoming messages appear in the chat log with the sender's name in bold. Outgoing messages echo back dimmed with a `you →` prefix and a delivery marker that updates in place:
+
+- `sending…` while the message leaves your machine
+- `sent` once it reaches the peer's connection
+- `delivered ✓` in green once the peer acknowledges receipt
+- `queued` if the recipient was offline and you chose to hold the message for later (see below)
+- `failed ✗` in red if it could not be sent or queued
+
+The chat history for the current session lives only in memory. cord keeps no readable message history on disk.
+
+## Offline queue
+
+If you `/msg` a verified contact who is not connected right now, cord asks whether to queue the message:
+
+    alice is offline. queue "your message" for delivery on reconnect? (y / n)
+
+Press `y` to hold it in an encrypted on disk queue. It shows as `queued`, and the next time cord connects to that contact it is resent, acknowledged, and flipped to `delivered ✓`. Press `n` or Esc to discard the message; it is never sent or stored.
+
+You do not have to reconnect by hand. While the queue holds anything for an offline contact, cord quietly tries that contact's onion address on its own, on a jittered timer that starts at 45 to 90 seconds and widens the longer they stay offline. It dials only contacts that have messages waiting, never to check who is online, and the attempts are invisible: nothing prints unless a message actually goes through. When the contact comes back, the queue flushes and the markers flip to `delivered ✓`. A LAN connection or a manual `/connect` still flushes the queue too.
+
+The queue is encrypted at rest with a passphrase you choose, because it is the only place your message content ever touches disk. Before cord will queue anything, set a passphrase once:
+
+    /passphrase
+
+You type it twice to confirm. cord derives a key from it with Argon2id; that key wraps a random master key (sealed with XChaCha20 Poly1305) that in turn seals the queue files. The wrapped master key lives at `<config_dir>/queue.key` with 0600 file mode. The passphrase itself is never stored.
+
+On a later run, if a queue already exists cord prompts you to unlock it so pending messages can resume:
+
+    /unlock
+
+The status bar shows the queue state: `off` (no passphrase set yet), `locked` (set but not unlocked this run), or `on` (unlocked and ready). If you forget the passphrase the queued messages cannot be recovered; delete `<config_dir>/queue.key` and the `<config_dir>/queue/` directory to start fresh.
+
+To discard everything waiting in the queue, run `/clearqueue`. It deletes the queued messages without reading them, so it works even when the queue is locked. Any messages still shown as `queued` flip to `dropped`.
+
+Limits in this version:
+
+- Delivery is at least once. If a connection drops after the peer received a message but before its acknowledgement reached you, the message is resent on the next connect and the peer may see it twice.
+- A message sent in the brief moment before a silent disconnect is noticed can still be lost. cord tears a connection down as soon as the peer closes it, so this window is small; but a peer that vanishes without closing the connection (a yanked network cable) is not noticed until the next write fails.
+- The background retry runs on a timer; it does not yet notice the instant your network comes back, so after you regain connectivity a queued message can wait out the rest of its current interval (at most about a minute and a half on the first attempt) before the next attempt. A manual `/connect` delivers immediately if you do not want to wait.
 
 ## Tests
 

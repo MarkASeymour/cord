@@ -14,22 +14,28 @@ use tor_cell::relaycell::msg::Connected;
 use tor_hsservice::{handle_rend_requests, StreamRequest};
 use tor_rtcompat::PreferredRuntime;
 
+use crate::crypto::{self, Vault};
 use crate::discovery::{mdns, PeerEvent};
 use crate::errors::CordError;
+use crate::identity::store::write_atomic_0600;
 use crate::identity::{Identity, PeerId};
-use crate::messaging::Frame;
+use crate::messaging::{Frame, Queue, QueuedMessage};
 use crate::noise::{self, NoiseStream, StaticKey};
 use crate::transport::lan::LanTransport;
 use crate::transport::onion::{self, OnionLaunch};
 
-use self::events::{AppMsg, LocalAddrs, Role, TransportCmd};
+use self::events::{AppMsg, ContactRoute, DeliveryStatus, LocalAddrs, Role, TransportCmd};
 
 pub mod events;
+mod retry;
 
 const ONION_PORT: u16 = 1;
 const CONNECTION_QUEUE: usize = 32;
 
 type Connections = Arc<Mutex<HashMap<[u8; 32], mpsc::Sender<Frame>>>>;
+type SharedQueue = Arc<Mutex<Option<Queue>>>;
+/// Verified contacts the retry loop may poll, synced from the TUI.
+type SharedRoutes = Arc<Mutex<Vec<ContactRoute>>>;
 
 pub struct TransportTask {
     pub handle: JoinHandle<()>,
@@ -48,6 +54,9 @@ pub async fn spawn(
     let local = lan.local_addr()?;
 
     let connections: Connections = Arc::new(Mutex::new(HashMap::new()));
+    let queue: SharedQueue = Arc::new(Mutex::new(None));
+    let routes: SharedRoutes = Arc::new(Mutex::new(Vec::new()));
+    let (retry_kick_tx, retry_kick_rx) = mpsc::channel::<()>(8);
 
     let (peer_event_tx, peer_event_rx) = mpsc::channel(64);
     let mdns_handle = mdns::start(peer_id, local.port(), peer_event_tx)?;
@@ -55,6 +64,10 @@ pub async fn spawn(
     let _ = msg_tx
         .send(AppMsg::TransportReady(LocalAddrs { lan: local }))
         .await;
+
+    if crypto::vault_file_path(&config_dir).exists() {
+        let _ = msg_tx.send(AppMsg::VaultLocked).await;
+    }
 
     let in_flight: Arc<Mutex<HashSet<PeerId>>> = Arc::new(Mutex::new(HashSet::new()));
 
@@ -64,6 +77,7 @@ pub async fn spawn(
         peer_id,
         msg_tx.clone(),
         connections.clone(),
+        queue.clone(),
     );
     spawn_discovery_loop(
         peer_event_rx,
@@ -72,20 +86,28 @@ pub async fn spawn(
         in_flight,
         msg_tx.clone(),
         connections.clone(),
+        queue.clone(),
     );
 
     let (onion_connect_tx, onion_connect_rx) = mpsc::channel::<String>(8);
     spawn_onion(
-        config_dir,
+        config_dir.clone(),
         msg_tx.clone(),
         static_key.clone(),
         peer_id,
         onion_connect_rx,
         connections.clone(),
+        queue.clone(),
+        routes.clone(),
+        retry_kick_rx,
     );
 
     let route_msg_tx = msg_tx.clone();
     let route_connections = connections.clone();
+    let route_queue = queue.clone();
+    let route_config_dir = config_dir.clone();
+    let route_routes = routes.clone();
+    let route_kick_tx = retry_kick_tx.clone();
     let handle = tokio::spawn(async move {
         let mut mdns_handle = Some(mdns_handle);
         while let Some(cmd) = cmd_rx.recv().await {
@@ -94,27 +116,160 @@ pub async fn spawn(
                 TransportCmd::ConnectOnion(addr) => {
                     let _ = onion_connect_tx.send(addr).await;
                 }
-                TransportCmd::SendMessage { remote_static, text } => {
+                TransportCmd::SetupVault(passphrase) => {
+                    let path = crypto::vault_file_path(&route_config_dir);
+                    if path.exists() {
+                        let _ = route_msg_tx
+                            .send(AppMsg::VaultFailed(
+                                "a vault already exists; use /unlock".into(),
+                            ))
+                            .await;
+                    } else {
+                        match Vault::create(&passphrase.0) {
+                            Ok((vault, file)) => match write_atomic_0600(&path, &file) {
+                                Ok(()) => {
+                                    *route_queue.lock().await =
+                                        Some(Queue::new(&route_config_dir, Arc::new(vault)));
+                                    let _ = route_msg_tx.send(AppMsg::VaultReady).await;
+                                }
+                                Err(e) => {
+                                    let _ = route_msg_tx
+                                        .send(AppMsg::VaultFailed(format!(
+                                            "could not write vault file: {e}"
+                                        )))
+                                        .await;
+                                }
+                            },
+                            Err(e) => {
+                                let _ = route_msg_tx
+                                    .send(AppMsg::VaultFailed(e.to_string()))
+                                    .await;
+                            }
+                        }
+                    }
+                }
+                TransportCmd::UnlockVault(passphrase) => {
+                    let path = crypto::vault_file_path(&route_config_dir);
+                    match std::fs::read(&path) {
+                        Ok(bytes) => match Vault::unlock(&passphrase.0, &bytes) {
+                            Ok(vault) => {
+                                *route_queue.lock().await =
+                                    Some(Queue::new(&route_config_dir, Arc::new(vault)));
+                                let _ = route_msg_tx.send(AppMsg::VaultReady).await;
+                                // unlocked: a prior backlog is now readable
+                                let _ = route_kick_tx.try_send(());
+                            }
+                            Err(e) => {
+                                let _ = route_msg_tx
+                                    .send(AppMsg::VaultFailed(e.to_string()))
+                                    .await;
+                            }
+                        },
+                        Err(_) => {
+                            let _ = route_msg_tx
+                                .send(AppMsg::VaultFailed(
+                                    "no vault to unlock; use /passphrase to create one".into(),
+                                ))
+                                .await;
+                        }
+                    }
+                }
+                TransportCmd::ClearQueue => {
+                    match crate::messaging::queue::clear(&route_config_dir) {
+                        Ok(count) => {
+                            let _ = route_msg_tx.send(AppMsg::QueueCleared { count }).await;
+                        }
+                        Err(e) => {
+                            let _ = route_msg_tx
+                                .send(AppMsg::Log(format!("clear queue failed: {e}")))
+                                .await;
+                        }
+                    }
+                }
+                TransportCmd::SyncContacts(new_routes) => {
+                    *route_routes.lock().await = new_routes;
+                    // a new route may match an existing backlog
+                    let _ = route_kick_tx.try_send(());
+                }
+                TransportCmd::SendMessage { remote_static, id, text } => {
                     let sender = {
                         let guard = route_connections.lock().await;
                         guard.get(&remote_static).cloned()
                     };
                     match sender {
                         Some(tx) => {
-                            if tx.send(Frame::Text(text)).await.is_err() {
+                            if tx.send(Frame::Msg { id, text }).await.is_ok() {
                                 let _ = route_msg_tx
-                                    .send(AppMsg::Log(
-                                        "send failed: connection closed".into(),
-                                    ))
+                                    .send(AppMsg::DeliveryUpdate {
+                                        id,
+                                        status: DeliveryStatus::Sent,
+                                    })
+                                    .await;
+                            } else {
+                                let _ = route_msg_tx
+                                    .send(AppMsg::DeliveryUpdate {
+                                        id,
+                                        status: DeliveryStatus::Failed,
+                                    })
+                                    .await;
+                                let _ = route_msg_tx
+                                    .send(AppMsg::Log("send failed: connection closed".into()))
                                     .await;
                             }
                         }
                         None => {
-                            let _ = route_msg_tx
-                                .send(AppMsg::Log(
-                                    "no active connection to that contact".into(),
-                                ))
-                                .await;
+                            // recipient offline: queue the message if a vault is ready
+                            let hex = hex32(&remote_static);
+                            let outcome = {
+                                let guard = route_queue.lock().await;
+                                guard
+                                    .as_ref()
+                                    .map(|q| q.enqueue(&hex, QueuedMessage { id, text }))
+                            };
+                            match outcome {
+                                Some(Ok(())) => {
+                                    let _ = route_msg_tx
+                                        .send(AppMsg::DeliveryUpdate {
+                                            id,
+                                            status: DeliveryStatus::Queued,
+                                        })
+                                        .await;
+                                    let _ = route_msg_tx
+                                        .send(AppMsg::Log(
+                                            "recipient offline: queued, will deliver on reconnect"
+                                                .into(),
+                                        ))
+                                        .await;
+                                    // freshly queued: poll now, not next window
+                                    let _ = route_kick_tx.try_send(());
+                                }
+                                Some(Err(e)) => {
+                                    let _ = route_msg_tx
+                                        .send(AppMsg::DeliveryUpdate {
+                                            id,
+                                            status: DeliveryStatus::Failed,
+                                        })
+                                        .await;
+                                    let _ = route_msg_tx
+                                        .send(AppMsg::Log(format!("queue write failed: {e}")))
+                                        .await;
+                                }
+                                None => {
+                                    let _ = route_msg_tx
+                                        .send(AppMsg::DeliveryUpdate {
+                                            id,
+                                            status: DeliveryStatus::Failed,
+                                        })
+                                        .await;
+                                    let hint = if crypto::vault_file_path(&route_config_dir).exists()
+                                    {
+                                        "recipient offline and queue locked: /unlock first, then resend"
+                                    } else {
+                                        "recipient offline: set a passphrase with /passphrase to enable the offline queue, then resend"
+                                    };
+                                    let _ = route_msg_tx.send(AppMsg::Log(hint.into())).await;
+                                }
+                            }
                         }
                     }
                 }
@@ -134,6 +289,7 @@ fn spawn_accept_loop(
     own_id: PeerId,
     msg_tx: mpsc::Sender<AppMsg>,
     connections: Connections,
+    queue: SharedQueue,
 ) {
     tokio::spawn(async move {
         loop {
@@ -142,6 +298,7 @@ fn spawn_accept_loop(
                     let static_key = static_key.clone();
                     let msg_tx = msg_tx.clone();
                     let connections = connections.clone();
+                    let queue = queue.clone();
                     tokio::spawn(async move {
                         handshake_as_responder_tcp(
                             sock,
@@ -149,6 +306,7 @@ fn spawn_accept_loop(
                             own_id,
                             msg_tx,
                             connections,
+                            queue,
                         )
                         .await;
                     });
@@ -171,6 +329,7 @@ fn spawn_discovery_loop(
     in_flight: Arc<Mutex<HashSet<PeerId>>>,
     msg_tx: mpsc::Sender<AppMsg>,
     connections: Connections,
+    queue: SharedQueue,
 ) {
     tokio::spawn(async move {
         while let Some(event) = peer_event_rx.recv().await {
@@ -187,6 +346,7 @@ fn spawn_discovery_loop(
                             let msg_tx = msg_tx.clone();
                             let in_flight = in_flight.clone();
                             let connections = connections.clone();
+                            let queue = queue.clone();
                             tokio::spawn(async move {
                                 handshake_as_initiator_tcp(
                                     addr,
@@ -195,6 +355,7 @@ fn spawn_discovery_loop(
                                     peer_id,
                                     msg_tx,
                                     connections,
+                                    queue,
                                 )
                                 .await;
                                 in_flight.lock().await.remove(&peer_id);
@@ -210,6 +371,7 @@ fn spawn_discovery_loop(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_onion(
     config_dir: PathBuf,
     msg_tx: mpsc::Sender<AppMsg>,
@@ -217,6 +379,9 @@ fn spawn_onion(
     own_id: PeerId,
     mut connect_rx: mpsc::Receiver<String>,
     connections: Connections,
+    queue: SharedQueue,
+    routes: SharedRoutes,
+    retry_kick_rx: mpsc::Receiver<()>,
 ) {
     tokio::spawn(async move {
         let _ = msg_tx
@@ -244,6 +409,18 @@ fn spawn_onion(
             })
             .await;
 
+        // Tor is up: the retry loop can dial onions now.
+        retry::spawn(
+            tor_client.clone(),
+            routes,
+            retry_kick_rx,
+            static_key.clone(),
+            own_id,
+            msg_tx.clone(),
+            connections.clone(),
+            queue.clone(),
+        );
+
         let mut stream_requests = Box::pin(handle_rend_requests(rend_requests));
 
         loop {
@@ -253,8 +430,9 @@ fn spawn_onion(
                     let static_key = static_key.clone();
                     let msg_tx = msg_tx.clone();
                     let connections = connections.clone();
+                    let queue = queue.clone();
                     tokio::spawn(async move {
-                        accept_onion_stream(req, static_key, own_id, msg_tx, connections).await;
+                        accept_onion_stream(req, static_key, own_id, msg_tx, connections, queue).await;
                     });
                 }
                 // outbound: user typed /connect
@@ -263,8 +441,9 @@ fn spawn_onion(
                     let static_key = static_key.clone();
                     let msg_tx = msg_tx.clone();
                     let connections = connections.clone();
+                    let queue = queue.clone();
                     tokio::spawn(async move {
-                        connect_onion_peer(client, addr_str, static_key, own_id, msg_tx, connections).await;
+                        connect_onion_peer(client, addr_str, static_key, own_id, msg_tx, connections, queue, false).await;
                     });
                 }
                 else => break,
@@ -281,6 +460,7 @@ async fn handshake_as_initiator_tcp(
     expected_peer_id: PeerId,
     msg_tx: mpsc::Sender<AppMsg>,
     connections: Connections,
+    queue: SharedQueue,
 ) {
     let result = async {
         let sock = TcpStream::connect(addr).await?;
@@ -299,8 +479,15 @@ async fn handshake_as_initiator_tcp(
     }
     .await;
 
-    handle_handshake_result(result, Role::Initiator, Some(expected_peer_id), msg_tx, connections)
-        .await;
+    handle_handshake_result(
+        result,
+        Role::Initiator,
+        Some(expected_peer_id),
+        msg_tx,
+        connections,
+        queue,
+    )
+    .await;
 }
 
 async fn handshake_as_responder_tcp(
@@ -309,6 +496,7 @@ async fn handshake_as_responder_tcp(
     own_id: PeerId,
     msg_tx: mpsc::Sender<AppMsg>,
     connections: Connections,
+    queue: SharedQueue,
 ) {
     let result = async {
         let mut stream = noise::handshake_responder(sock, &static_key).await?;
@@ -326,7 +514,7 @@ async fn handshake_as_responder_tcp(
     }
     .await;
 
-    handle_handshake_result(result, Role::Responder, None, msg_tx, connections).await;
+    handle_handshake_result(result, Role::Responder, None, msg_tx, connections, queue).await;
 }
 
 async fn accept_onion_stream(
@@ -335,6 +523,7 @@ async fn accept_onion_stream(
     own_id: PeerId,
     msg_tx: mpsc::Sender<AppMsg>,
     connections: Connections,
+    queue: SharedQueue,
 ) {
     let data_stream = match req.accept(Connected::new_empty()).await {
         Ok(s) => s,
@@ -357,9 +546,12 @@ async fn accept_onion_stream(
     }
     .await;
 
-    handle_handshake_result(result, Role::Responder, None, msg_tx, connections).await;
+    handle_handshake_result(result, Role::Responder, None, msg_tx, connections, queue).await;
 }
 
+/// Dial a peer's onion and handshake as initiator. `quiet` (the retry loop)
+/// suppresses the connecting log and failure reporting; only success surfaces.
+#[allow(clippy::too_many_arguments)]
 async fn connect_onion_peer(
     client: TorClient<PreferredRuntime>,
     onion_addr: String,
@@ -367,11 +559,15 @@ async fn connect_onion_peer(
     own_id: PeerId,
     msg_tx: mpsc::Sender<AppMsg>,
     connections: Connections,
+    queue: SharedQueue,
+    quiet: bool,
 ) {
     let trimmed = onion_addr.trim().to_string();
-    let _ = msg_tx
-        .send(AppMsg::Log(format!("onion: connecting to {trimmed}…")))
-        .await;
+    if !quiet {
+        let _ = msg_tx
+            .send(AppMsg::Log(format!("onion: connecting to {trimmed}…")))
+            .await;
+    }
     let result = async {
         let data_stream = client
             .connect((trimmed.as_str(), ONION_PORT))
@@ -388,7 +584,23 @@ async fn connect_onion_peer(
     }
     .await;
 
-    handle_handshake_result(result, Role::Initiator, None, msg_tx, connections).await;
+    if quiet {
+        if let Ok((stream, peer_id, sas, remote_static)) = result {
+            spawn_established_connection(
+                stream,
+                peer_id,
+                sas,
+                remote_static,
+                Role::Initiator,
+                msg_tx,
+                connections,
+                queue,
+            )
+            .await;
+        }
+    } else {
+        handle_handshake_result(result, Role::Initiator, None, msg_tx, connections, queue).await;
+    }
 }
 
 async fn handle_handshake_result<S>(
@@ -397,29 +609,23 @@ async fn handle_handshake_result<S>(
     expected_peer_id: Option<PeerId>,
     msg_tx: mpsc::Sender<AppMsg>,
     connections: Connections,
+    queue: SharedQueue,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     match result {
         Ok((stream, peer_id, sas, remote_static)) => {
-            let (send_tx, send_rx) = mpsc::channel::<Frame>(CONNECTION_QUEUE);
-            connections.lock().await.insert(remote_static, send_tx);
-            let _ = msg_tx
-                .send(AppMsg::HandshakeOk {
-                    peer_id,
-                    role,
-                    sas,
-                    remote_static,
-                })
-                .await;
-            tokio::spawn(run_connection(
+            spawn_established_connection(
                 stream,
                 peer_id,
+                sas,
                 remote_static,
-                send_rx,
+                role,
                 msg_tx,
                 connections,
-            ));
+                queue,
+            )
+            .await;
         }
         Err(e) => {
             let _ = msg_tx
@@ -433,20 +639,96 @@ async fn handle_handshake_result<S>(
     }
 }
 
+/// Register a completed handshake and start its connection task. Shared by
+/// every success path (LAN, onion accept, `/connect`, retry).
+#[allow(clippy::too_many_arguments)]
+async fn spawn_established_connection<S>(
+    stream: NoiseStream<S>,
+    peer_id: PeerId,
+    sas: String,
+    remote_static: [u8; 32],
+    role: Role,
+    msg_tx: mpsc::Sender<AppMsg>,
+    connections: Connections,
+    queue: SharedQueue,
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let (send_tx, send_rx) = mpsc::channel::<Frame>(CONNECTION_QUEUE);
+    connections.lock().await.insert(remote_static, send_tx.clone());
+    let _ = msg_tx
+        .send(AppMsg::HandshakeOk {
+            peer_id,
+            role,
+            sas,
+            remote_static,
+        })
+        .await;
+    tokio::spawn(run_connection(
+        stream,
+        peer_id,
+        remote_static,
+        send_tx,
+        send_rx,
+        msg_tx,
+        connections,
+        queue,
+    ));
+}
+
 async fn run_connection<S>(
     stream: NoiseStream<S>,
     peer_id: PeerId,
     remote_static: [u8; 32],
+    ack_tx: mpsc::Sender<Frame>,
     mut send_rx: mpsc::Receiver<Frame>,
     msg_tx: mpsc::Sender<AppMsg>,
     connections: Connections,
+    queue: SharedQueue,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    // Deliver anything queued for this peer while they were offline. Runs as
+    // its own task so the writer loop below drains the channel concurrently; a
+    // backlog larger than the channel buffer would otherwise deadlock.
+    {
+        let flush_ack = ack_tx.clone();
+        let flush_queue = queue.clone();
+        let flush_msg_tx = msg_tx.clone();
+        tokio::spawn(async move {
+            let hex = hex32(&remote_static);
+            let pending = {
+                let guard = flush_queue.lock().await;
+                guard.as_ref().and_then(|q| q.load(&hex).ok())
+            };
+            if let Some(msgs) = pending {
+                for m in msgs {
+                    if flush_ack
+                        .send(Frame::Msg {
+                            id: m.id,
+                            text: m.text,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    let _ = flush_msg_tx
+                        .send(AppMsg::DeliveryUpdate {
+                            id: m.id,
+                            status: DeliveryStatus::Sent,
+                        })
+                        .await;
+                }
+            }
+        });
+    }
+
     let (mut reader, mut writer) = stream.split();
 
     let read_msg_tx = msg_tx.clone();
-    let read_task = tokio::spawn(async move {
+    let ack_queue = queue.clone();
+    let mut read_task = tokio::spawn(async move {
         loop {
             match reader.recv().await {
                 Ok(bytes) => match Frame::decode(&bytes) {
@@ -456,6 +738,42 @@ async fn run_connection<S>(
                                 from_peer_id: peer_id,
                                 remote_static,
                                 text,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Ok(Frame::Msg { id, text }) => {
+                        // Acknowledge receipt so the sender can mark it
+                        // delivered and drop its queued copy, then surface it.
+                        let _ = ack_tx.send(Frame::Ack(id)).await;
+                        if read_msg_tx
+                            .send(AppMsg::MessageReceived {
+                                from_peer_id: peer_id,
+                                remote_static,
+                                text,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Ok(Frame::Ack(id)) => {
+                        // The peer has it: drop our queued copy.
+                        {
+                            let hex = hex32(&remote_static);
+                            let guard = ack_queue.lock().await;
+                            if let Some(q) = guard.as_ref() {
+                                let _ = q.remove(&hex, id);
+                            }
+                        }
+                        if read_msg_tx
+                            .send(AppMsg::DeliveryUpdate {
+                                id,
+                                status: DeliveryStatus::Delivered,
                             })
                             .await
                             .is_err()
@@ -475,10 +793,23 @@ async fn run_connection<S>(
         }
     });
 
-    while let Some(frame) = send_rx.recv().await {
-        if let Err(e) = writer.send(&frame.encode()).await {
-            let _ = msg_tx.send(AppMsg::Log(format!("send: {e}"))).await;
-            break;
+    // Pump outgoing frames, but also stop the instant the read task ends. The
+    // read task ends when the peer closes its side, so this tears the
+    // connection down promptly instead of waiting for a future write to fail.
+    // Without it the registry keeps a dead entry and the sender keeps routing
+    // new messages to a connection that is already gone.
+    loop {
+        tokio::select! {
+            maybe_frame = send_rx.recv() => match maybe_frame {
+                Some(frame) => {
+                    if let Err(e) = writer.send(&frame.encode()).await {
+                        let _ = msg_tx.send(AppMsg::Log(format!("send: {e}"))).await;
+                        break;
+                    }
+                }
+                None => break,
+            },
+            _ = &mut read_task => break,
         }
     }
 
@@ -507,6 +838,15 @@ fn capture_remote_static<S>(stream: &NoiseStream<S>) -> Result<[u8; 32], noise::
     Ok(out)
 }
 
+fn hex32(bytes: &[u8; 32]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(64);
+    for b in bytes {
+        let _ = write!(&mut s, "{b:02x}");
+    }
+    s
+}
+
 fn decode_peer_id(bytes: &[u8]) -> Result<PeerId, noise::NoiseError> {
     if bytes.len() != PeerId::BYTE_LEN {
         return Err(noise::NoiseError::BadPayload(format!(
@@ -518,4 +858,78 @@ fn decode_peer_id(bytes: &[u8]) -> Result<PeerId, noise::NoiseError> {
     let mut id_bytes = [0u8; PeerId::BYTE_LEN];
     id_bytes.copy_from_slice(bytes);
     Ok(PeerId::from_bytes(id_bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::noise::StaticKey;
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    // When the peer closes its side, run_connection must tear the connection
+    // down promptly (drop it from the registry, emit PeerDisconnected) even
+    // when no outgoing write is in flight. Otherwise the sender keeps treating
+    // the dead peer as connected and a later message is lost instead of queued.
+    #[tokio::test]
+    async fn dropped_peer_tears_down_connection_promptly() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let key_a = StaticKey::generate().unwrap();
+        let key_b = StaticKey::generate().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            noise::handshake_responder(sock, &key_b).await.unwrap()
+        });
+        let client_sock = TcpStream::connect(addr).await.unwrap();
+        let client = noise::handshake_initiator(client_sock, &key_a).await.unwrap();
+        let peer_stream = server.await.unwrap();
+
+        let (msg_tx, mut msg_rx) = mpsc::channel(16);
+        let (send_tx, send_rx) = mpsc::channel(8);
+        let connections: Connections = Arc::new(Mutex::new(HashMap::new()));
+        let queue: SharedQueue = Arc::new(Mutex::new(None));
+        let remote_static = [7u8; 32];
+        connections
+            .lock()
+            .await
+            .insert(remote_static, send_tx.clone());
+
+        tokio::spawn(run_connection(
+            client,
+            PeerId::generate(),
+            remote_static,
+            send_tx.clone(),
+            send_rx,
+            msg_tx,
+            connections.clone(),
+            queue,
+        ));
+
+        // Hold a sender open so the connection can only end via the read side.
+        let _keep_alive = send_tx;
+
+        // The peer goes away.
+        drop(peer_stream);
+
+        let torn_down = timeout(Duration::from_secs(2), async {
+            while let Some(msg) = msg_rx.recv().await {
+                if matches!(msg, AppMsg::PeerDisconnected { .. }) {
+                    return true;
+                }
+            }
+            false
+        })
+        .await;
+
+        assert!(
+            matches!(torn_down, Ok(true)),
+            "peer dropped but no PeerDisconnected was emitted: teardown was not prompt"
+        );
+        assert!(
+            connections.lock().await.is_empty(),
+            "dead connection was not removed from the registry"
+        );
+    }
 }

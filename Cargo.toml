@@ -5,9 +5,11 @@ edition = "2021"
 
 [dependencies]
 argh = "0.1"
-arti-client = { version = "0.42", default-features = false, features = ["tokio", "rustls", "compression", "onion-service-client", "onion-service-service"] }
+argon2 = "0.5"
+arti-client ={ version = "0.42", default-features = false, features = ["tokio", "rustls", "compression", "onion-service-client", "onion-service-service"] }
 base64 = "0.22"
-crossterm = { version = "0.28", features = ["event-stream"] }
+chacha20poly1305 = "0.10"
+crossterm ={ version = "0.28", features = ["event-stream"] }
 directories = "5"
 futures = "0.3"
 hkdf = "0.12"

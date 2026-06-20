@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Stdout};
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -21,21 +21,31 @@ use crate::contacts::{self, Contact, ContactBlob, ContactStatus};
 use crate::discovery::KnownPeer;
 use crate::errors::CordError;
 use crate::identity::{Identity, PeerId};
-use crate::runtime::events::{AppMsg, LocalAddrs, TransportCmd};
+use crate::runtime::events::{AppMsg, ContactRoute, DeliveryStatus, LocalAddrs, TransportCmd};
 
 pub mod input;
 pub mod layout;
 pub mod view;
 
 const CHAT_LOG_CAP: usize = 500;
+const SYSTEM_LOG_CAP: usize = 500;
 
 pub struct App {
     pub identity: Identity,
     pub transport_state: TransportState,
     pub peers: HashMap<PeerId, KnownPeer>,
     pub contacts: Vec<Contact>,
+    pub contacts_dirty: bool,
     pub chat_log: VecDeque<ChatEntry>,
+    pub system_log: VecDeque<String>,
     pub input_buffer: String,
+    pub mode: InputMode,
+    pub vault_ready: bool,
+    pub vault_locked: bool,
+    pub connected: HashSet<[u8; 32]>,
+    pub focus: Pane,
+    pub chat_view: PaneView,
+    pub log_view: PaneView,
     pub should_quit: bool,
 }
 
@@ -58,57 +68,202 @@ pub enum TransportState {
 }
 
 pub enum ChatEntry {
-    System(String),
     Incoming { from: String, text: String },
-    Outgoing { to: String, text: String },
+    Outgoing {
+        to: String,
+        text: String,
+        id: u64,
+        status: DeliveryStatus,
+    },
+}
+
+/// The two scrollable panes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Pane {
+    Conversation,
+    SystemLog,
+}
+
+/// Scroll state for one pane. `offset` is the absolute row the pane is scrolled
+/// to; `None` means follow the newest line (pinned to the bottom). `max` and
+/// `page` are cached from the last render so the input handler can page and
+/// clamp without recomputing the wrapped layout. Holding an absolute offset
+/// (rather than a distance from the bottom) keeps the view anchored to the same
+/// lines as new content arrives below.
+pub struct PaneView {
+    pub offset: Option<u16>,
+    pub max: u16,
+    pub page: u16,
+}
+
+impl PaneView {
+    fn new() -> Self {
+        Self {
+            offset: None,
+            max: 0,
+            page: 1,
+        }
+    }
+
+    /// Row to scroll to this frame, given the freshly computed maximum.
+    pub fn resolve(&self, max: u16) -> u16 {
+        match self.offset {
+            None => max,
+            Some(y) => y.min(max),
+        }
+    }
+
+    /// True when the pane is held above the newest line.
+    pub fn is_scrolled(&self) -> bool {
+        self.offset.is_some_and(|y| y < self.max)
+    }
+
+    pub fn page_up(&mut self) {
+        let cur = self.offset.unwrap_or(self.max);
+        self.offset = Some(cur.saturating_sub(self.page.max(1)));
+    }
+
+    pub fn page_down(&mut self) {
+        let cur = self.offset.unwrap_or(self.max);
+        let next = cur.saturating_add(self.page.max(1));
+        if next >= self.max {
+            self.offset = None; // reaching the bottom resumes following
+        } else {
+            self.offset = Some(next);
+        }
+    }
+
+    pub fn to_top(&mut self) {
+        self.offset = Some(0);
+    }
+
+    pub fn to_bottom(&mut self) {
+        self.offset = None;
+    }
+}
+
+/// Whether keystrokes go to the chat input line or to a masked passphrase
+/// prompt overlaid on it.
+pub enum InputMode {
+    Normal,
+    Passphrase(PassphrasePrompt),
+    Confirm(ConfirmPrompt),
+}
+
+/// A yes or no prompt asking whether to queue a message that could not be sent
+/// right now. The message is held here until the user decides; on no it is
+/// dropped without ever being sent or queued.
+pub struct ConfirmPrompt {
+    pub remote_static: [u8; 32],
+    pub id: u64,
+    pub text: String,
+    pub label: String,
+}
+
+impl ConfirmPrompt {
+    pub fn question(&self) -> String {
+        let mut preview: String = self.text.chars().take(40).collect();
+        if self.text.chars().count() > 40 {
+            preview.push('…');
+        }
+        format!(
+            "{} is offline. queue \"{}\" for delivery on reconnect? (y / n)",
+            self.label, preview
+        )
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PassphrasePurpose {
+    Create,
+    Unlock,
+}
+
+pub enum PassphraseStage {
+    Enter,
+    Confirm { first: String },
+    Waiting,
+}
+
+pub struct PassphrasePrompt {
+    pub purpose: PassphrasePurpose,
+    pub stage: PassphraseStage,
+    pub buffer: String,
+    pub error: Option<String>,
+}
+
+impl PassphrasePrompt {
+    fn new(purpose: PassphrasePurpose) -> Self {
+        Self {
+            purpose,
+            stage: PassphraseStage::Enter,
+            buffer: String::new(),
+            error: None,
+        }
+    }
+
+    pub fn title(&self) -> &'static str {
+        match self.stage {
+            PassphraseStage::Waiting => "working…",
+            PassphraseStage::Confirm { .. } => "confirm passphrase",
+            PassphraseStage::Enter => match self.purpose {
+                PassphrasePurpose::Create => "set a queue passphrase",
+                PassphrasePurpose::Unlock => "unlock queue",
+            },
+        }
+    }
 }
 
 impl App {
     pub fn new(identity: Identity) -> Self {
-        let mut chat_log = VecDeque::with_capacity(CHAT_LOG_CAP);
-        chat_log.push_back(ChatEntry::System("welcome to cord".to_string()));
+        let mut system_log: VecDeque<String> = VecDeque::with_capacity(SYSTEM_LOG_CAP);
+        system_log.push_back("welcome to cord".to_string());
         if identity.freshly_generated {
-            chat_log.push_back(ChatEntry::System(format!(
+            system_log.push_back(format!(
                 "identity generated at {}",
                 identity.config_dir.display()
-            )));
-            chat_log.push_back(ChatEntry::System(format!(
+            ));
+            system_log.push_back(format!(
                 "peer-id (full): {}. keep the config directory safe.",
                 identity.peer_id
-            )));
+            ));
         } else {
-            chat_log.push_back(ChatEntry::System(format!(
+            system_log.push_back(format!(
                 "identity loaded from {}",
                 identity.config_dir.display()
-            )));
+            ));
         }
 
         let contacts = match contacts::load(&identity.config_dir) {
             Ok(list) => {
                 if !list.is_empty() {
-                    chat_log.push_back(ChatEntry::System(format!(
-                        "loaded {} contact(s) from disk",
-                        list.len()
-                    )));
+                    system_log.push_back(format!("loaded {} contact(s) from disk", list.len()));
                 }
                 list
             }
             Err(e) => {
-                chat_log.push_back(ChatEntry::System(format!("contacts: load failed: {e}")));
+                system_log.push_back(format!("contacts: load failed: {e}"));
                 Vec::new()
             }
         };
 
-        chat_log.push_back(ChatEntry::System(
-            "ready. type /help for commands. Esc to quit.".to_string(),
-        ));
+        system_log.push_back("ready. type /help for commands. Esc to quit.".to_string());
         Self {
             identity,
             transport_state: TransportState::Bootstrapping,
             peers: HashMap::new(),
             contacts,
-            chat_log,
+            contacts_dirty: false,
+            chat_log: VecDeque::with_capacity(CHAT_LOG_CAP),
+            system_log,
             input_buffer: String::new(),
+            mode: InputMode::Normal,
+            vault_ready: false,
+            vault_locked: false,
+            connected: HashSet::new(),
+            focus: Pane::Conversation,
+            chat_view: PaneView::new(),
+            log_view: PaneView::new(),
             should_quit: false,
         }
     }
@@ -182,6 +337,7 @@ impl App {
                 if let Err(e) = contacts::save(&self.identity.config_dir, &self.contacts) {
                     self.push_system(format!("contacts: save failed: {e}"));
                 }
+                self.contacts_dirty = true;
                 self.push_system(format!("removed contact: {}", removed.short_label()));
             }
             _ => self.push_system(format!(
@@ -230,12 +386,26 @@ impl App {
                 if let Err(e) = contacts::save(&self.identity.config_dir, &self.contacts) {
                     self.push_system(format!("contacts: save failed: {e}"));
                 }
+                self.contacts_dirty = true;
                 self.push_system(format!("{verb} contact: {label}"));
             }
             _ => self.push_system(format!(
                 "multiple contacts match {query:?}. use a more specific name or longer hex prefix."
             )),
         }
+    }
+
+    /// Verified contacts as routes for the runtime's retry loop.
+    pub fn verified_routes(&self) -> Vec<ContactRoute> {
+        self.contacts
+            .iter()
+            .filter(|c| c.status == ContactStatus::Verified)
+            .map(|c| ContactRoute {
+                remote_static: c.blob.noise_static_pub,
+                hs_id: c.blob.hs_id,
+                label: c.short_label(),
+            })
+            .collect()
     }
 
     pub fn list_contacts(&mut self) {
@@ -270,15 +440,23 @@ impl App {
     }
 
     pub fn push_system(&mut self, line: impl Into<String>) {
-        self.push_entry(ChatEntry::System(line.into()));
+        if self.system_log.len() == SYSTEM_LOG_CAP {
+            self.system_log.pop_front();
+        }
+        self.system_log.push_back(line.into());
     }
 
     pub fn push_incoming(&mut self, from: String, text: String) {
         self.push_entry(ChatEntry::Incoming { from, text });
     }
 
-    pub fn push_outgoing(&mut self, to: String, text: String) {
-        self.push_entry(ChatEntry::Outgoing { to, text });
+    pub fn push_outgoing(&mut self, to: String, text: String, id: u64, status: DeliveryStatus) {
+        self.push_entry(ChatEntry::Outgoing {
+            to,
+            text,
+            id,
+            status,
+        });
     }
 
     fn push_entry(&mut self, entry: ChatEntry) {
@@ -354,6 +532,7 @@ impl App {
                 }
             }
             AppMsg::HandshakeOk { peer_id, role, sas, remote_static } => {
+                self.connected.insert(remote_static);
                 self.push_system(format!(
                     "handshake ok ({}): {}",
                     role.label(),
@@ -407,8 +586,54 @@ impl App {
                 self.push_incoming(from, text);
             }
             AppMsg::PeerDisconnected { remote_static, .. } => {
+                self.connected.remove(&remote_static);
                 let who = self.label_for_remote(&remote_static);
                 self.push_system(format!("disconnected: {who}"));
+            }
+            AppMsg::DeliveryUpdate { id, status } => self.update_delivery(id, status),
+            AppMsg::VaultLocked => {
+                self.vault_locked = true;
+                self.push_system(
+                    "a saved message queue was found. enter your passphrase to unlock and resume pending deliveries (Esc to skip).",
+                );
+                if matches!(self.mode, InputMode::Normal) {
+                    self.mode =
+                        InputMode::Passphrase(PassphrasePrompt::new(PassphrasePurpose::Unlock));
+                }
+            }
+            AppMsg::VaultReady => {
+                self.vault_ready = true;
+                self.vault_locked = false;
+                self.mode = InputMode::Normal;
+                self.push_system(
+                    "offline queue ready. messages to an offline contact are held and delivered when they reconnect.",
+                );
+            }
+            AppMsg::VaultFailed(msg) => {
+                if let InputMode::Passphrase(p) = &mut self.mode {
+                    p.stage = PassphraseStage::Enter;
+                    p.buffer.clear();
+                    p.error = Some(msg);
+                } else {
+                    self.push_system(format!("vault: {msg}"));
+                }
+            }
+            AppMsg::QueueCleared { count } => {
+                // Anything still showing as queued will not be delivered now.
+                for entry in self.chat_log.iter_mut() {
+                    if let ChatEntry::Outgoing { status, .. } = entry {
+                        if *status == DeliveryStatus::Queued {
+                            *status = DeliveryStatus::Dropped;
+                        }
+                    }
+                }
+                if count == 0 {
+                    self.push_system("message queue is already empty");
+                } else {
+                    self.push_system(format!(
+                        "cleared the message queue ({count} contact(s) had pending messages)"
+                    ));
+                }
             }
         }
     }
@@ -419,6 +644,45 @@ impl App {
             .find(|c| &c.blob.noise_static_pub == remote_static)
             .map(|c| c.short_label())
             .unwrap_or_else(|| "unknown".to_string())
+    }
+
+    fn update_delivery(&mut self, id: u64, status: DeliveryStatus) {
+        // The matching message is almost always recent, so scan newest first.
+        for entry in self.chat_log.iter_mut().rev() {
+            if let ChatEntry::Outgoing {
+                id: entry_id,
+                status: entry_status,
+                ..
+            } = entry
+            {
+                if *entry_id == id {
+                    *entry_status = status;
+                    return;
+                }
+            }
+        }
+    }
+
+    pub fn begin_passphrase_create(&mut self) {
+        self.mode = InputMode::Passphrase(PassphrasePrompt::new(PassphrasePurpose::Create));
+    }
+
+    pub fn begin_passphrase_unlock(&mut self) {
+        self.mode = InputMode::Passphrase(PassphrasePrompt::new(PassphrasePurpose::Unlock));
+    }
+
+    pub fn toggle_focus(&mut self) {
+        self.focus = match self.focus {
+            Pane::Conversation => Pane::SystemLog,
+            Pane::SystemLog => Pane::Conversation,
+        };
+    }
+
+    pub fn focused_view(&mut self) -> &mut PaneView {
+        match self.focus {
+            Pane::Conversation => &mut self.chat_view,
+            Pane::SystemLog => &mut self.log_view,
+        }
     }
 
     pub fn resolve_contact_onion(&self, query: &str) -> Result<String, String> {
@@ -474,17 +738,39 @@ impl App {
         }
         let remote_static = self.contacts[i].blob.noise_static_pub;
         let label = self.contacts[i].short_label();
-        if cmd_tx
-            .try_send(TransportCmd::SendMessage {
+        let id = rand::random::<u64>();
+
+        if self.connected.contains(&remote_static) {
+            // a live connection exists: send straight away
+            if cmd_tx
+                .try_send(TransportCmd::SendMessage {
+                    remote_static,
+                    id,
+                    text: text.to_string(),
+                })
+                .is_err()
+            {
+                self.push_system("send queue full");
+                return;
+            }
+            self.push_outgoing(label, text.to_string(), id, DeliveryStatus::Sending);
+        } else if self.vault_ready {
+            // recipient offline but queueable: ask before queueing
+            self.mode = InputMode::Confirm(ConfirmPrompt {
                 remote_static,
+                id,
                 text: text.to_string(),
-            })
-            .is_err()
-        {
-            self.push_system("send queue full");
-            return;
+                label,
+            });
+        } else if self.vault_locked {
+            self.push_system(format!(
+                "{label} is offline and the queue is locked. /unlock first, then resend."
+            ));
+        } else {
+            self.push_system(format!(
+                "{label} is offline. set a passphrase with /passphrase to enable the offline queue, then resend."
+            ));
         }
-        self.push_outgoing(label, text.to_string());
     }
 }
 
@@ -510,8 +796,13 @@ async fn run_loop(
     let mut events = EventStream::new();
     let mut ticker = interval(Duration::from_millis(50));
 
+    // initial route sync
+    let _ = cmd_tx
+        .send(TransportCmd::SyncContacts(app.verified_routes()))
+        .await;
+
     loop {
-        terminal.draw(|f| view::render(f, &app))?;
+        terminal.draw(|f| view::render(f, &mut app))?;
         if app.should_quit {
             return Ok(());
         }
@@ -521,6 +812,13 @@ async fn run_loop(
                     Ok(event) => {
                         if let Some(cmd) = input::handle(&mut app, event, cmd_tx) {
                             let _ = cmd_tx.send(cmd).await;
+                        }
+                        // re-sync if the command changed the verified set
+                        if app.contacts_dirty {
+                            app.contacts_dirty = false;
+                            let _ = cmd_tx
+                                .send(TransportCmd::SyncContacts(app.verified_routes()))
+                                .await;
                         }
                     }
                     Err(e) => return Err(e.into()),
