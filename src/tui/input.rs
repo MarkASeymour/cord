@@ -68,7 +68,7 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent) -> Option<TransportCmd> {
     match key.code {
         KeyCode::Char('y') | KeyCode::Char('Y') => {
             app.mode = InputMode::Normal;
-            app.push_outgoing(label, text.clone(), id, DeliveryStatus::Sending);
+            app.push_outgoing(remote_static, label, text.clone(), id, DeliveryStatus::Sending);
             Some(TransportCmd::SendMessage {
                 remote_static,
                 id,
@@ -223,6 +223,15 @@ fn submit(app: &mut App, cmd_tx: &mpsc::Sender<TransportCmd>) -> Option<Transpor
         app.list_contacts();
         return None;
     }
+    if let Some(rest) = text.strip_prefix("/to ") {
+        let q = rest.trim();
+        if q.is_empty() {
+            app.push_system("usage: /to <name-or-hex>");
+            return None;
+        }
+        app.switch_to(q);
+        return None;
+    }
     if let Some(rest) = text.strip_prefix("/verify ") {
         let q = rest.trim();
         if q.is_empty() {
@@ -302,7 +311,7 @@ fn submit(app: &mut App, cmd_tx: &mpsc::Sender<TransportCmd>) -> Option<Transpor
         app.push_system(format!("unknown command: {text}. type /help."));
         return None;
     }
-    app.push_system(format!("(echo) {text}"));
+    app.send_active(&text, cmd_tx);
     None
 }
 
@@ -314,7 +323,8 @@ fn show_help(app: &mut App) {
     app.push_system("  /verify <name-or-hex>  upgrade a pending contact to verified (after comparing the SAS aloud)");
     app.push_system("  /reject <name-or-hex>  mark a contact as rejected");
     app.push_system("  /unpair <name-or-hex>  remove a contact entirely (use to start over)");
-    app.push_system("  /msg <name> <text>   send a text message to a verified contact");
+    app.push_system("  /to <name-or-hex>    set the active contact; then just type to message them");
+    app.push_system("  /msg <name> <text>   send a one off message without changing the active contact");
     app.push_system("  /connect <name-or-hex>  dial a verified contact (or a raw .onion address)");
     app.push_system("  /passphrase          set a passphrase to enable the encrypted offline queue");
     app.push_system("  /unlock              unlock the offline queue for this session");
@@ -324,5 +334,5 @@ fn show_help(app: &mut App) {
     app.push_system("keys:");
     app.push_system("  Esc, Ctrl-C          exit");
     app.push_system("  Enter                submit");
-    app.push_system("note: messaging requires both sides verified. if a contact is offline, cord asks whether to queue the message (encrypted on disk; needs a passphrase via /passphrase); answer no to discard it.");
+    app.push_system("note: pick a contact with /to, then plain text you type is sent to them. messaging requires both sides verified. if a contact is offline, cord asks whether to queue the message (encrypted on disk; needs a passphrase via /passphrase); answer no to discard it.");
 }

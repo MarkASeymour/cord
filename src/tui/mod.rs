@@ -36,7 +36,8 @@ pub struct App {
     pub peers: HashMap<PeerId, KnownPeer>,
     pub contacts: Vec<Contact>,
     pub contacts_dirty: bool,
-    pub chat_log: VecDeque<ChatEntry>,
+    pub conversations: HashMap<[u8; 32], Conversation>,
+    pub active: Option<[u8; 32]>,
     pub system_log: VecDeque<String>,
     pub input_buffer: String,
     pub mode: InputMode,
@@ -67,14 +68,41 @@ pub enum TransportState {
     Failed(String),
 }
 
+#[derive(Clone)]
 pub enum ChatEntry {
-    Incoming { from: String, text: String },
+    Incoming {
+        from: String,
+        text: String,
+    },
     Outgoing {
         to: String,
         text: String,
         id: u64,
         status: DeliveryStatus,
     },
+}
+
+/// One contact's messages and unread tally, keyed in `App.conversations` by the
+/// contact's Noise static key.
+pub struct Conversation {
+    pub entries: VecDeque<ChatEntry>,
+    pub unread: usize,
+}
+
+impl Conversation {
+    fn new() -> Self {
+        Self {
+            entries: VecDeque::new(),
+            unread: 0,
+        }
+    }
+
+    fn push(&mut self, entry: ChatEntry) {
+        if self.entries.len() == CHAT_LOG_CAP {
+            self.entries.pop_front();
+        }
+        self.entries.push_back(entry);
+    }
 }
 
 /// The two scrollable panes.
@@ -248,13 +276,14 @@ impl App {
         };
 
         system_log.push_back("ready. type /help for commands. Esc to quit.".to_string());
-        Self {
+        let mut app = Self {
             identity,
             transport_state: TransportState::Bootstrapping,
             peers: HashMap::new(),
             contacts,
             contacts_dirty: false,
-            chat_log: VecDeque::with_capacity(CHAT_LOG_CAP),
+            conversations: HashMap::new(),
+            active: None,
             system_log,
             input_buffer: String::new(),
             mode: InputMode::Normal,
@@ -265,7 +294,9 @@ impl App {
             chat_view: PaneView::new(),
             log_view: PaneView::new(),
             should_quit: false,
-        }
+        };
+        app.active = app.first_verified_key();
+        app
     }
 
     pub fn pair_with(&mut self, blob_text: &str) {
@@ -446,24 +477,36 @@ impl App {
         self.system_log.push_back(line.into());
     }
 
-    pub fn push_incoming(&mut self, from: String, text: String) {
-        self.push_entry(ChatEntry::Incoming { from, text });
+    pub fn push_incoming(&mut self, remote_static: [u8; 32], from: String, text: String) {
+        let unread = self.active != Some(remote_static);
+        let convo = self
+            .conversations
+            .entry(remote_static)
+            .or_insert_with(Conversation::new);
+        convo.push(ChatEntry::Incoming { from, text });
+        if unread {
+            convo.unread += 1;
+        }
     }
 
-    pub fn push_outgoing(&mut self, to: String, text: String, id: u64, status: DeliveryStatus) {
-        self.push_entry(ChatEntry::Outgoing {
+    pub fn push_outgoing(
+        &mut self,
+        remote_static: [u8; 32],
+        to: String,
+        text: String,
+        id: u64,
+        status: DeliveryStatus,
+    ) {
+        let convo = self
+            .conversations
+            .entry(remote_static)
+            .or_insert_with(Conversation::new);
+        convo.push(ChatEntry::Outgoing {
             to,
             text,
             id,
             status,
         });
-    }
-
-    fn push_entry(&mut self, entry: ChatEntry) {
-        if self.chat_log.len() == CHAT_LOG_CAP {
-            self.chat_log.pop_front();
-        }
-        self.chat_log.push_back(entry);
     }
 
     pub fn apply(&mut self, msg: AppMsg) {
@@ -592,7 +635,7 @@ impl App {
                 ..
             } => {
                 let from = self.label_for_remote(&remote_static);
-                self.push_incoming(from, text);
+                self.push_incoming(remote_static, from, text);
             }
             AppMsg::PeerDisconnected { remote_static, .. } => {
                 self.connected.remove(&remote_static);
@@ -636,10 +679,12 @@ impl App {
             }
             AppMsg::QueueCleared { count } => {
                 // Anything still showing as queued will not be delivered now.
-                for entry in self.chat_log.iter_mut() {
-                    if let ChatEntry::Outgoing { status, .. } = entry {
-                        if *status == DeliveryStatus::Queued {
-                            *status = DeliveryStatus::Dropped;
+                for convo in self.conversations.values_mut() {
+                    for entry in convo.entries.iter_mut() {
+                        if let ChatEntry::Outgoing { status, .. } = entry {
+                            if *status == DeliveryStatus::Queued {
+                                *status = DeliveryStatus::Dropped;
+                            }
                         }
                     }
                 }
@@ -664,16 +709,18 @@ impl App {
 
     fn update_delivery(&mut self, id: u64, status: DeliveryStatus) {
         // The matching message is almost always recent, so scan newest first.
-        for entry in self.chat_log.iter_mut().rev() {
-            if let ChatEntry::Outgoing {
-                id: entry_id,
-                status: entry_status,
-                ..
-            } = entry
-            {
-                if *entry_id == id {
-                    *entry_status = status;
-                    return;
+        for convo in self.conversations.values_mut() {
+            for entry in convo.entries.iter_mut().rev() {
+                if let ChatEntry::Outgoing {
+                    id: entry_id,
+                    status: entry_status,
+                    ..
+                } = entry
+                {
+                    if *entry_id == id {
+                        *entry_status = status;
+                        return;
+                    }
                 }
             }
         }
@@ -719,6 +766,81 @@ impl App {
         Ok(address)
     }
 
+    /// First verified contact's Noise static key, in contact list order.
+    fn first_verified_key(&self) -> Option<[u8; 32]> {
+        self.contacts
+            .iter()
+            .find(|c| c.status == ContactStatus::Verified)
+            .map(|c| c.blob.noise_static_pub)
+    }
+
+    fn set_active(&mut self, remote_static: [u8; 32]) {
+        self.active = Some(remote_static);
+        self.chat_view.to_bottom();
+        if let Some(convo) = self.conversations.get_mut(&remote_static) {
+            convo.unread = 0;
+        }
+    }
+
+    /// `/to <name>`: make a verified contact the active one so plain text goes
+    /// to them.
+    pub fn switch_to(&mut self, query: &str) {
+        let matches: Vec<usize> = self
+            .contacts
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.matches_query(query))
+            .map(|(i, _)| i)
+            .collect();
+        let i = match matches.as_slice() {
+            [] => {
+                self.push_system(format!("no contact matches {query:?}"));
+                return;
+            }
+            [i] => *i,
+            _ => {
+                self.push_system(format!(
+                    "multiple contacts match {query:?}. be more specific."
+                ));
+                return;
+            }
+        };
+        if self.contacts[i].status != ContactStatus::Verified {
+            let label = self.contacts[i].short_label();
+            self.push_system(format!("{label} is not verified. /verify them first."));
+            return;
+        }
+        let remote_static = self.contacts[i].blob.noise_static_pub;
+        let label = self.contacts[i].short_label();
+        self.set_active(remote_static);
+        self.push_system(format!("now talking to {label}. just type to send."));
+    }
+
+    /// Send plain typed text to the active contact, defaulting to the first
+    /// verified contact when none is active yet.
+    pub fn send_active(&mut self, text: &str, cmd_tx: &mpsc::Sender<TransportCmd>) {
+        if self.active.is_none() {
+            self.active = self.first_verified_key();
+        }
+        let Some(remote_static) = self.active else {
+            self.push_system("no verified contact yet. /pair someone, /verify them, then just type.");
+            return;
+        };
+        let label = self
+            .contacts
+            .iter()
+            .find(|c| {
+                c.blob.noise_static_pub == remote_static && c.status == ContactStatus::Verified
+            })
+            .map(|c| c.short_label());
+        let Some(label) = label else {
+            self.active = None;
+            self.push_system("the active contact is no longer verified. use /to <name>.");
+            return;
+        };
+        self.dispatch_message(remote_static, label, text, cmd_tx);
+    }
+
     pub fn send_to_contact(
         &mut self,
         query: &str,
@@ -754,8 +876,17 @@ impl App {
         }
         let remote_static = self.contacts[i].blob.noise_static_pub;
         let label = self.contacts[i].short_label();
-        let id = rand::random::<u64>();
+        self.dispatch_message(remote_static, label, text, cmd_tx);
+    }
 
+    fn dispatch_message(
+        &mut self,
+        remote_static: [u8; 32],
+        label: String,
+        text: &str,
+        cmd_tx: &mpsc::Sender<TransportCmd>,
+    ) {
+        let id = rand::random::<u64>();
         if self.connected.contains(&remote_static) {
             // a live connection exists: send straight away
             if cmd_tx
@@ -769,7 +900,7 @@ impl App {
                 self.push_system("send queue full");
                 return;
             }
-            self.push_outgoing(label, text.to_string(), id, DeliveryStatus::Sending);
+            self.push_outgoing(remote_static, label, text.to_string(), id, DeliveryStatus::Sending);
         } else if self.vault_ready {
             // recipient offline but queueable: ask before queueing
             self.mode = InputMode::Confirm(ConfirmPrompt {
@@ -861,4 +992,210 @@ fn restore_terminal(
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::noise::StaticKey;
+    use std::sync::Arc;
+
+    fn test_app() -> App {
+        let identity = Identity {
+            peer_id: PeerId::generate(),
+            noise_static: Arc::new(StaticKey::generate().unwrap()),
+            config_dir: std::env::temp_dir().join("cord-tui-step1-test"),
+            freshly_generated: false,
+        };
+        App::new(identity)
+    }
+
+    fn contact(key: [u8; 32], name: &str, status: ContactStatus) -> Contact {
+        Contact {
+            blob: ContactBlob {
+                noise_static_pub: key,
+                hs_id: [0u8; 32],
+                display_name: Some(name.to_string()),
+            },
+            status,
+        }
+    }
+
+    #[test]
+    fn messages_route_to_per_contact_conversations() {
+        let mut app = test_app();
+        let alice = [1u8; 32];
+        let bob = [2u8; 32];
+
+        app.push_incoming(alice, "alice".into(), "hi".into());
+        app.push_outgoing(alice, "alice".into(), "hey".into(), 10, DeliveryStatus::Sending);
+        app.push_incoming(bob, "bob".into(), "yo".into());
+
+        assert_eq!(app.conversations.len(), 2);
+        assert_eq!(app.conversations[&alice].entries.len(), 2);
+        assert_eq!(app.conversations[&bob].entries.len(), 1);
+    }
+
+    #[test]
+    fn incoming_to_inactive_contact_counts_unread() {
+        let mut app = test_app();
+        let alice = [1u8; 32];
+
+        // active is None, so an incoming message is unread
+        app.push_incoming(alice, "alice".into(), "one".into());
+        app.push_incoming(alice, "alice".into(), "two".into());
+        assert_eq!(app.conversations[&alice].unread, 2);
+
+        // the active contact's incoming does not add unread
+        app.active = Some(alice);
+        app.push_incoming(alice, "alice".into(), "three".into());
+        assert_eq!(app.conversations[&alice].unread, 2);
+    }
+
+    #[test]
+    fn conversation_preserves_insertion_order() {
+        let mut app = test_app();
+        let alice = [1u8; 32];
+
+        app.push_incoming(alice, "alice".into(), "first".into());
+        app.push_incoming(alice, "alice".into(), "second".into());
+
+        let texts: Vec<String> = app.conversations[&alice]
+            .entries
+            .iter()
+            .map(|e| match e {
+                ChatEntry::Incoming { text, .. } | ChatEntry::Outgoing { text, .. } => text.clone(),
+            })
+            .collect();
+        assert_eq!(texts, vec!["first", "second"]);
+    }
+
+    #[test]
+    fn to_command_sets_active_and_clears_unread() {
+        let mut app = test_app();
+        let alice = [1u8; 32];
+        app.contacts.push(contact(alice, "alice", ContactStatus::Verified));
+
+        app.push_incoming(alice, "alice".into(), "hi".into());
+        assert_eq!(app.conversations[&alice].unread, 1);
+
+        app.switch_to("alice");
+        assert_eq!(app.active, Some(alice));
+        assert_eq!(app.conversations[&alice].unread, 0);
+    }
+
+    #[test]
+    fn to_command_refuses_unverified_contact() {
+        let mut app = test_app();
+        let alice = [1u8; 32];
+        app.contacts.push(contact(alice, "alice", ContactStatus::Pending));
+
+        app.switch_to("alice");
+        assert_eq!(app.active, None);
+    }
+
+    #[test]
+    fn first_verified_key_skips_non_verified() {
+        let mut app = test_app();
+        let pending = [1u8; 32];
+        let verified = [2u8; 32];
+        app.contacts.push(contact(pending, "p", ContactStatus::Pending));
+        app.contacts.push(contact(verified, "v", ContactStatus::Verified));
+
+        assert_eq!(app.first_verified_key(), Some(verified));
+    }
+
+    #[test]
+    fn typing_sends_to_active_contact_when_connected() {
+        let mut app = test_app();
+        let alice = [1u8; 32];
+        app.contacts.push(contact(alice, "alice", ContactStatus::Verified));
+        app.switch_to("alice");
+        app.connected.insert(alice);
+
+        let (tx, mut rx) = mpsc::channel(8);
+        app.send_active("hello", &tx);
+
+        match rx.try_recv() {
+            Ok(TransportCmd::SendMessage { remote_static, text, .. }) => {
+                assert_eq!(remote_static, alice);
+                assert_eq!(text, "hello");
+            }
+            other => panic!("expected SendMessage, got {other:?}"),
+        }
+        assert_eq!(app.conversations[&alice].entries.len(), 1);
+    }
+
+    #[test]
+    fn typing_with_no_verified_contact_does_nothing() {
+        let mut app = test_app();
+        let (tx, _rx) = mpsc::channel(8);
+
+        app.send_active("hello", &tx);
+
+        assert_eq!(app.active, None);
+        assert!(app.conversations.is_empty());
+    }
+
+    #[test]
+    fn delivery_update_finds_the_message_across_conversations() {
+        let mut app = test_app();
+        let alice = [1u8; 32];
+
+        app.push_outgoing(alice, "alice".into(), "hey".into(), 42, DeliveryStatus::Sending);
+        app.update_delivery(42, DeliveryStatus::Delivered);
+
+        match app.conversations[&alice].entries.back().unwrap() {
+            ChatEntry::Outgoing { status, .. } => {
+                assert_eq!(*status, DeliveryStatus::Delivered)
+            }
+            _ => panic!("expected outgoing entry"),
+        }
+    }
+
+    fn render_to_text(app: &mut App, w: u16, h: u16) -> String {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal.draw(|f| view::render(f, app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let mut s = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                if let Some(cell) = buf.cell((x, y)) {
+                    s.push_str(cell.symbol());
+                }
+            }
+            s.push('\n');
+        }
+        s
+    }
+
+    #[test]
+    fn wide_layout_shows_sidebar_and_active_messages() {
+        let mut app = test_app();
+        let alice = [1u8; 32];
+        app.contacts.push(contact(alice, "alice", ContactStatus::Verified));
+        app.switch_to("alice");
+        app.push_incoming(alice, "alice".into(), "hello there".into());
+
+        let text = render_to_text(&mut app, 80, 20);
+        assert!(text.contains("contacts"), "sidebar header missing:\n{text}");
+        assert!(text.contains("alice"), "contact name missing:\n{text}");
+        assert!(text.contains("hello there"), "active message missing:\n{text}");
+    }
+
+    #[test]
+    fn narrow_layout_hides_sidebar() {
+        let mut app = test_app();
+        let alice = [1u8; 32];
+        app.contacts.push(contact(alice, "alice", ContactStatus::Verified));
+        app.switch_to("alice");
+
+        let text = render_to_text(&mut app, 50, 20);
+        assert!(
+            !text.contains("contacts"),
+            "sidebar should be hidden on a narrow terminal:\n{text}"
+        );
+    }
 }

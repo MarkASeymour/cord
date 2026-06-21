@@ -3,6 +3,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 
+use crate::contacts::ContactStatus;
 use crate::runtime::events::DeliveryStatus;
 
 use super::{layout, App, ChatEntry, InputMode, Pane, TransportState};
@@ -10,7 +11,14 @@ use super::{layout, App, ChatEntry, InputMode, Pane, TransportState};
 const SHORT_ONION: usize = 16;
 
 pub fn render(frame: &mut Frame, app: &mut App) {
-    let (status, chat, log, input, footer) = layout::split(frame.area());
+    let layout::Regions {
+        status,
+        sidebar,
+        chat,
+        log,
+        input,
+        footer,
+    } = layout::split(frame.area());
 
     let status_line = Line::from(vec![
         Span::styled("cord ", Style::default().add_modifier(Modifier::BOLD)),
@@ -23,30 +31,43 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     ]);
     frame.render_widget(Paragraph::new(status_line), status);
 
+    let active_label = app.active.and_then(|k| {
+        app.contacts
+            .iter()
+            .find(|c| c.blob.noise_static_pub == k)
+            .map(|c| c.short_label())
+    });
+
     let chat_lines: Vec<Line> = app
-        .chat_log
-        .iter()
-        .map(|entry| match entry {
-            ChatEntry::Incoming { from, text } => Line::from(vec![
-                Span::styled(
-                    format!("{from}: "),
-                    Style::default().add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(text.clone()),
-            ]),
-            ChatEntry::Outgoing {
-                to, text, status, ..
-            } => Line::from(vec![
-                Span::styled(
-                    format!("you → {to}: "),
-                    Style::default().add_modifier(Modifier::DIM),
-                ),
-                Span::raw(text.clone()),
-                Span::raw("  "),
-                Span::styled(status.marker(), delivery_style(*status)),
-            ]),
-        })
-        .collect();
+        .active
+        .and_then(|k| app.conversations.get(&k))
+        .map(|convo| convo.entries.iter().map(entry_line).collect())
+        .unwrap_or_else(|| {
+            vec![Line::from(Span::styled(
+                "no conversation. /to <name> to pick a verified contact, then type.",
+                Style::default().add_modifier(Modifier::DIM),
+            ))]
+        });
+
+    if let Some(sidebar) = sidebar {
+        let sidebar_block = Block::default()
+            .borders(Borders::TOP | Borders::RIGHT)
+            .title(Line::from(Span::styled(
+                " contacts ",
+                Style::default().add_modifier(Modifier::BOLD),
+            )));
+        frame.render_widget(
+            Paragraph::new(sidebar_lines(app))
+                .block(sidebar_block)
+                .wrap(Wrap { trim: true }),
+            sidebar,
+        );
+    }
+
+    let chat_title = match &active_label {
+        Some(name) => format!("conversation: {name}"),
+        None => "conversation".to_string(),
+    };
     // The top border takes one row, so the content height is one less.
     let chat_inner_h = chat.height.saturating_sub(1);
     let chat_max = max_scroll(&chat_lines, chat.width, chat_inner_h);
@@ -54,7 +75,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     app.chat_view.page = chat_inner_h.max(1);
     let chat_offset = app.chat_view.resolve(chat_max);
     let chat_block = Block::default().borders(Borders::TOP).title(pane_title(
-        "conversation",
+        &chat_title,
         app.focus == Pane::Conversation,
         app.chat_view.is_scrolled(),
     ));
@@ -183,6 +204,77 @@ fn pane_title(name: &str, focused: bool, scrolled: bool) -> Line<'static> {
         Style::default().add_modifier(Modifier::DIM)
     };
     Line::from(Span::styled(label, style))
+}
+
+fn entry_line(entry: &ChatEntry) -> Line<'static> {
+    match entry {
+        ChatEntry::Incoming { from, text, .. } => Line::from(vec![
+            Span::styled(
+                format!("{from}: "),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(text.clone()),
+        ]),
+        ChatEntry::Outgoing {
+            to, text, status, ..
+        } => Line::from(vec![
+            Span::styled(
+                format!("you → {to}: "),
+                Style::default().add_modifier(Modifier::DIM),
+            ),
+            Span::raw(text.clone()),
+            Span::raw("  "),
+            Span::styled(status.marker(), delivery_style(*status)),
+        ]),
+    }
+}
+
+/// One row per contact: a caret on the active one, the name, and either the
+/// unread count or the pairing status glyph. Never shows connection state.
+fn sidebar_lines(app: &App) -> Vec<Line<'static>> {
+    if app.contacts.is_empty() {
+        return vec![Line::from(Span::styled(
+            "no contacts. /pair <blob>",
+            Style::default().add_modifier(Modifier::DIM),
+        ))];
+    }
+    app.contacts
+        .iter()
+        .map(|c| {
+            let key = c.blob.noise_static_pub;
+            let is_active = app.active == Some(key);
+            let unread = app.conversations.get(&key).map(|cv| cv.unread).unwrap_or(0);
+            let name_style = if is_active {
+                Style::default().add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            let right = if unread > 0 {
+                Span::styled(
+                    format!(" {unread}"),
+                    Style::default().add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::styled(
+                    format!(" {}", status_glyph(c.status)),
+                    Style::default().add_modifier(Modifier::DIM),
+                )
+            };
+            Line::from(vec![
+                Span::styled(if is_active { "› " } else { "  " }, name_style),
+                Span::styled(c.short_label(), name_style),
+                right,
+            ])
+        })
+        .collect()
+}
+
+fn status_glyph(status: ContactStatus) -> &'static str {
+    match status {
+        ContactStatus::Verified => "✓",
+        ContactStatus::Pending => "?",
+        ContactStatus::Rejected => "✗",
+    }
 }
 
 fn delivery_style(status: DeliveryStatus) -> Style {
