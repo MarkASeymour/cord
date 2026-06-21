@@ -44,6 +44,7 @@ pub struct App {
     pub vault_ready: bool,
     pub vault_locked: bool,
     pub connected: HashSet<[u8; 32]>,
+    pub show_log: bool,
     pub focus: Pane,
     pub chat_view: PaneView,
     pub log_view: PaneView,
@@ -106,7 +107,7 @@ impl Conversation {
 }
 
 /// The two scrollable panes.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Pane {
     Conversation,
     SystemLog,
@@ -275,7 +276,7 @@ impl App {
             }
         };
 
-        system_log.push_back("ready. type /help for commands. Esc to quit.".to_string());
+        system_log.push_back("ready. type /help for commands. Ctrl-C to quit.".to_string());
         let mut app = Self {
             identity,
             transport_state: TransportState::Bootstrapping,
@@ -290,6 +291,7 @@ impl App {
             vault_ready: false,
             vault_locked: false,
             connected: HashSet::new(),
+            show_log: true,
             focus: Pane::Conversation,
             chat_view: PaneView::new(),
             log_view: PaneView::new(),
@@ -734,7 +736,18 @@ impl App {
         self.mode = InputMode::Passphrase(PassphrasePrompt::new(PassphrasePurpose::Unlock));
     }
 
+    pub fn toggle_log(&mut self) {
+        self.show_log = !self.show_log;
+        if !self.show_log && self.focus == Pane::SystemLog {
+            self.focus = Pane::Conversation;
+        }
+    }
+
     pub fn toggle_focus(&mut self) {
+        if !self.show_log {
+            self.focus = Pane::Conversation;
+            return;
+        }
         self.focus = match self.focus {
             Pane::Conversation => Pane::SystemLog,
             Pane::SystemLog => Pane::Conversation,
@@ -998,6 +1011,7 @@ fn restore_terminal(
 mod tests {
     use super::*;
     use crate::noise::StaticKey;
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
     use std::sync::Arc;
 
     fn test_app() -> App {
@@ -1197,5 +1211,57 @@ mod tests {
             !text.contains("contacts"),
             "sidebar should be hidden on a narrow terminal:\n{text}"
         );
+    }
+
+    #[test]
+    fn toggle_log_flips_and_moves_focus_off_hidden_log() {
+        let mut app = test_app();
+        assert!(app.show_log);
+        app.focus = Pane::SystemLog;
+
+        app.toggle_log();
+        assert!(!app.show_log);
+        assert_eq!(app.focus, Pane::Conversation);
+
+        app.toggle_log();
+        assert!(app.show_log);
+    }
+
+    #[test]
+    fn hidden_log_drops_pane_and_shows_latest_line_in_status() {
+        let mut app = test_app();
+        app.push_system("boomtoken");
+        app.show_log = false;
+
+        let text = render_to_text(&mut app, 120, 20);
+        assert!(!text.contains("system log"), "log pane should be hidden:\n{text}");
+        assert!(
+            text.contains("boomtoken"),
+            "latest system line should appear in the status bar:\n{text}"
+        );
+    }
+
+    #[test]
+    fn esc_clears_input_without_quitting() {
+        let mut app = test_app();
+        app.input_buffer.push_str("draft message");
+        let (tx, _rx) = mpsc::channel(8);
+
+        let key = Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
+        input::handle(&mut app, key, &tx);
+
+        assert!(app.input_buffer.is_empty());
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn ctrl_l_toggles_the_log() {
+        let mut app = test_app();
+        let (tx, _rx) = mpsc::channel(8);
+
+        let key = Event::Key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL));
+        input::handle(&mut app, key, &tx);
+
+        assert!(!app.show_log);
     }
 }

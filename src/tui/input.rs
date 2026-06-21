@@ -145,9 +145,16 @@ fn handle_key(
         app.should_quit = true;
         return None;
     }
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('l') | KeyCode::Char('L'))
+    {
+        app.toggle_log();
+        return None;
+    }
     match key.code {
         KeyCode::Esc => {
-            app.should_quit = true;
+            // cancel: clear the input line, never quit
+            app.input_buffer.clear();
             None
         }
         KeyCode::Enter => submit(app, cmd_tx),
@@ -332,7 +339,10 @@ fn show_help(app: &mut App) {
     app.push_system("  /help, /?            show this");
     app.push_system("  /quit, /q            exit");
     app.push_system("keys:");
-    app.push_system("  Esc, Ctrl-C          exit");
+    app.push_system("  Ctrl-C               quit");
+    app.push_system("  Esc                  clear the input line");
+    app.push_system("  Ctrl-L               show or hide the system log");
+    app.push_system("  Tab                  switch the pane the scroll keys drive");
     app.push_system("  Enter                submit");
     app.push_system("note: pick a contact with /to, then plain text you type is sent to them. messaging requires both sides verified. if a contact is offline, cord asks whether to queue the message (encrypted on disk; needs a passphrase via /passphrase); answer no to discard it.");
 }

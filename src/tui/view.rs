@@ -18,9 +18,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         log,
         input,
         footer,
-    } = layout::split(frame.area());
+    } = layout::split(frame.area(), app.show_log);
 
-    let status_line = Line::from(vec![
+    let mut status_spans = vec![
         Span::styled("cord ", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw("status: "),
         Span::raw(transport_label(&app.transport_state)),
@@ -28,8 +28,18 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         Span::raw(you_label(&app.transport_state, &app.identity.peer_id.short())),
         Span::raw(format!("  peers: {}", app.peers.len())),
         Span::raw(format!("  queue: {}", queue_label(app))),
-    ]);
-    frame.render_widget(Paragraph::new(status_line), status);
+    ];
+    // when the log is hidden, keep the latest system line in view
+    if !app.show_log {
+        if let Some(last) = app.system_log.back() {
+            status_spans.push(Span::raw("  ·  "));
+            status_spans.push(Span::styled(
+                last.clone(),
+                Style::default().add_modifier(Modifier::DIM),
+            ));
+        }
+    }
+    frame.render_widget(Paragraph::new(Line::from(status_spans)), status);
 
     let active_label = app.active.and_then(|k| {
         app.contacts
@@ -87,33 +97,35 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         chat,
     );
 
-    let log_lines: Vec<Line> = app
-        .system_log
-        .iter()
-        .map(|text| {
-            Line::from(Span::styled(
-                format!("· {text}"),
-                Style::default().add_modifier(Modifier::DIM),
-            ))
-        })
-        .collect();
-    let log_inner_h = log.height.saturating_sub(1);
-    let log_max = max_scroll(&log_lines, log.width, log_inner_h);
-    app.log_view.max = log_max;
-    app.log_view.page = log_inner_h.max(1);
-    let log_offset = app.log_view.resolve(log_max);
-    let log_block = Block::default().borders(Borders::TOP).title(pane_title(
-        "system log",
-        app.focus == Pane::SystemLog,
-        app.log_view.is_scrolled(),
-    ));
-    frame.render_widget(
-        Paragraph::new(log_lines)
-            .block(log_block)
-            .wrap(Wrap { trim: false })
-            .scroll((log_offset, 0)),
-        log,
-    );
+    if let Some(log) = log {
+        let log_lines: Vec<Line> = app
+            .system_log
+            .iter()
+            .map(|text| {
+                Line::from(Span::styled(
+                    format!("· {text}"),
+                    Style::default().add_modifier(Modifier::DIM),
+                ))
+            })
+            .collect();
+        let log_inner_h = log.height.saturating_sub(1);
+        let log_max = max_scroll(&log_lines, log.width, log_inner_h);
+        app.log_view.max = log_max;
+        app.log_view.page = log_inner_h.max(1);
+        let log_offset = app.log_view.resolve(log_max);
+        let log_block = Block::default().borders(Borders::TOP).title(pane_title(
+            "system log",
+            app.focus == Pane::SystemLog,
+            app.log_view.is_scrolled(),
+        ));
+        frame.render_widget(
+            Paragraph::new(log_lines)
+                .block(log_block)
+                .wrap(Wrap { trim: false })
+                .scroll((log_offset, 0)),
+            log,
+        );
+    }
 
     match &app.mode {
         InputMode::Passphrase(p) => {
@@ -159,7 +171,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     }
 
     let footer_line = Line::from(Span::styled(
-        "Enter send  ·  Tab switch pane  ·  PgUp/PgDn scroll  ·  End follow  ·  /help  ·  Esc quit",
+        "Enter send  ·  /to switch  ·  Ctrl-L log  ·  PgUp/PgDn scroll  ·  /help  ·  Ctrl-C quit",
         Style::default().add_modifier(Modifier::DIM),
     ));
     frame.render_widget(Paragraph::new(footer_line), footer);
