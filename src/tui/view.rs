@@ -9,8 +9,6 @@ use crate::runtime::events::DeliveryStatus;
 
 use super::{layout, App, ChatEntry, InputMode, Pane, SasPrompt, TransportState};
 
-const SHORT_ONION: usize = 16;
-
 pub fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
     let layout::Regions {
@@ -22,24 +20,28 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         footer,
     } = layout::split(area, app.show_log);
 
+    let instance = app
+        .identity
+        .config_dir
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("?");
     let mut status_spans = vec![
-        Span::styled("cord ", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw("status: "),
-        Span::raw(transport_label(&app.transport_state)),
-        Span::raw("  you: "),
-        Span::raw(you_label(&app.transport_state, &app.identity.peer_id.short())),
-        Span::raw(format!("  peers: {}", app.peers.len())),
-        Span::raw(format!("  queue: {}", queue_label(app))),
+        Span::styled("cord", Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!(" ({instance})"),
+            Style::default().add_modifier(Modifier::DIM),
+        ),
+        Span::raw(format!("  ·  {}", transport_label(&app.transport_state))),
+        Span::raw(format!("  ·  peers: {}", app.peers.len())),
+        Span::raw(format!("  ·  queue: {}", queue_label(app))),
     ];
-    // when the log is hidden, keep the latest system line in view
-    if !app.show_log {
-        if let Some(last) = app.system_log.back() {
-            status_spans.push(Span::raw("  ·  "));
-            status_spans.push(Span::styled(
-                last.clone(),
-                Style::default().add_modifier(Modifier::DIM),
-            ));
-        }
+    // when the log is hidden, nudge with the unread count instead of dumping the line
+    if !app.show_log && app.log_unread > 0 {
+        status_spans.push(Span::styled(
+            format!("  ·  log {}", app.log_unread),
+            Style::default().add_modifier(Modifier::DIM),
+        ));
     }
     frame.render_widget(Paragraph::new(Line::from(status_spans)), status);
 
@@ -100,6 +102,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     );
 
     if let Some(log) = log {
+        app.log_unread = 0;
         let log_lines: Vec<Line> = app
             .system_log
             .iter()
@@ -187,6 +190,10 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     ));
     frame.render_widget(Paragraph::new(footer_line), footer);
 
+    if app.show_help {
+        render_help_panel(frame, area);
+    }
+
     if let InputMode::Sas(p) = &app.mode {
         render_sas_modal(frame, area, p);
     }
@@ -228,6 +235,66 @@ fn render_sas_modal(frame: &mut Frame, area: Rect, p: &SasPrompt) {
         )),
     ];
     let block = Block::default().borders(Borders::ALL).title(" pairing ");
+    frame.render_widget(
+        Paragraph::new(lines).block(block).wrap(Wrap { trim: false }),
+        popup,
+    );
+}
+
+const HELP_COMMANDS: &[(&str, &str)] = &[
+    ("/share [name]", "print your contact blob to the log"),
+    ("/pair <blob>", "add a peer's blob as pending"),
+    ("/verify <name|hex>", "verify after comparing the SAS"),
+    ("/reject <name|hex>", "reject a contact"),
+    ("/unpair <name|hex>", "remove a contact"),
+    ("/to <name|hex>", "make this the active contact"),
+    ("/msg <name> <text>", "one off send, keep active contact"),
+    ("/connect <name|hex>", "dial a contact or .onion address"),
+    ("/passphrase", "enable the offline queue"),
+    ("/unlock", "unlock the offline queue"),
+    ("/clearqueue", "discard all queued messages"),
+    ("/help, /?", "show this panel"),
+    ("/quit, /q", "exit"),
+];
+
+const HELP_KEYS: &[(&str, &str)] = &[
+    ("Ctrl-C", "quit"),
+    ("Esc", "clear the input, or close a panel"),
+    ("Ctrl-L", "show or hide the system log"),
+    ("Tab", "switch the pane the scroll keys drive"),
+    ("Enter", "send a message or run a command"),
+];
+
+/// A centered reference panel listing the commands and keys, kept separate from
+/// the system log so reference and diagnostics do not mix.
+fn render_help_panel(frame: &mut Frame, area: Rect) {
+    let w = 66.min(area.width.saturating_sub(2));
+    let h = (HELP_COMMANDS.len() + HELP_KEYS.len() + 6) as u16;
+    let h = h.min(area.height.saturating_sub(2));
+    let popup = centered_rect(area, w, h);
+    frame.render_widget(Clear, popup);
+
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let mut lines = vec![Line::from(Span::styled("commands", bold))];
+    for (cmd, desc) in HELP_COMMANDS {
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {cmd:<20}"), bold),
+            Span::styled(*desc, dim),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled("keys", bold)));
+    for (k, desc) in HELP_KEYS {
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {k:<20}"), bold),
+            Span::styled(*desc, dim),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled("Esc to close", dim)));
+
+    let block = Block::default().borders(Borders::ALL).title(" help ");
     frame.render_widget(
         Paragraph::new(lines).block(block).wrap(Wrap { trim: false }),
         popup,
@@ -283,13 +350,8 @@ fn entry_line(entry: &ChatEntry) -> Line<'static> {
             ),
             Span::raw(text.clone()),
         ]),
-        ChatEntry::Outgoing {
-            to, text, status, ..
-        } => Line::from(vec![
-            Span::styled(
-                format!("you → {to}: "),
-                Style::default().add_modifier(Modifier::DIM),
-            ),
+        ChatEntry::Outgoing { text, status, .. } => Line::from(vec![
+            Span::styled("you: ", Style::default().add_modifier(Modifier::DIM)),
             Span::raw(text.clone()),
             Span::raw("  "),
             Span::styled(status.marker(), delivery_style(*status)),
@@ -365,35 +427,13 @@ fn queue_label(app: &App) -> &'static str {
 
 fn transport_label(state: &TransportState) -> String {
     match state {
-        TransportState::Bootstrapping => "bootstrapping…".to_string(),
+        TransportState::Bootstrapping => "starting…".to_string(),
         TransportState::BootstrappingTor {
-            percent,
-            summary,
-            lan: Some(lan),
-        } => format!("tor: {percent}% ({summary})  lan ({lan})"),
-        TransportState::BootstrappingTor {
-            percent,
-            summary,
-            lan: None,
-        } => format!("tor: {percent}% ({summary})"),
-        TransportState::Lan { listening_on } => format!("lan ({listening_on})"),
-        TransportState::Onion { lan: Some(lan), .. } => {
-            format!("onion + lan ({lan})")
-        }
-        TransportState::Onion { lan: None, .. } => "onion".to_string(),
+            percent, summary, ..
+        } => format!("tor {percent}% ({summary})"),
+        TransportState::Lan { .. } => "lan".to_string(),
+        TransportState::Onion { lan: Some(_), .. } => "onion ready (+lan)".to_string(),
+        TransportState::Onion { lan: None, .. } => "onion ready".to_string(),
         TransportState::Failed(msg) => format!("error: {msg}"),
-    }
-}
-
-fn you_label(state: &TransportState, peer_id_short: &str) -> String {
-    match state {
-        TransportState::Onion { onion_name, .. } => {
-            if onion_name.len() > SHORT_ONION {
-                format!("{}…", &onion_name[..SHORT_ONION])
-            } else {
-                onion_name.clone()
-            }
-        }
-        _ => peer_id_short.to_string(),
     }
 }

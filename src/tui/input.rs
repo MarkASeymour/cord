@@ -70,7 +70,7 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent) -> Option<TransportCmd> {
     match key.code {
         KeyCode::Char('y') | KeyCode::Char('Y') => {
             app.mode = InputMode::Normal;
-            app.push_outgoing(remote_static, label, text.clone(), id, DeliveryStatus::Sending);
+            app.push_outgoing(remote_static, text.clone(), id, DeliveryStatus::Sending);
             Some(TransportCmd::SendMessage {
                 remote_static,
                 id,
@@ -188,8 +188,12 @@ fn handle_key(
     }
     match key.code {
         KeyCode::Esc => {
-            // cancel: clear the input line, never quit
-            app.input_buffer.clear();
+            // cancel: close the help panel if open, else clear the input; never quit
+            if app.show_help {
+                app.show_help = false;
+            } else {
+                app.input_buffer.clear();
+            }
             None
         }
         KeyCode::Enter => submit(app, cmd_tx),
@@ -234,10 +238,10 @@ fn submit(app: &mut App, cmd_tx: &mpsc::Sender<TransportCmd>) -> Option<Transpor
         return None;
     }
     if text == "/help" || text == "/?" {
-        app.show_log = true; // its output is meant to be read
-        show_help(app);
+        app.show_help = true;
         return None;
     }
+    app.show_help = false; // any other action dismisses the commands panel
     if let Some(rest) = text.strip_prefix("/msg ") {
         let trimmed = rest.trim();
         match trimmed.split_once(char::is_whitespace) {
@@ -260,11 +264,6 @@ fn submit(app: &mut App, cmd_tx: &mpsc::Sender<TransportCmd>) -> Option<Transpor
             return None;
         }
         app.pair_with(trimmed);
-        return None;
-    }
-    if text == "/contacts" {
-        app.show_log = true;
-        app.list_contacts();
         return None;
     }
     if let Some(rest) = text.strip_prefix("/to ") {
@@ -361,27 +360,3 @@ fn submit(app: &mut App, cmd_tx: &mpsc::Sender<TransportCmd>) -> Option<Transpor
     None
 }
 
-fn show_help(app: &mut App) {
-    app.push_system("commands:");
-    app.push_system("  /share [name]        print your own contact blob, optionally with a display name");
-    app.push_system("  /pair <blob>         add a peer's contact blob (status: pending)");
-    app.push_system("  /contacts            list paired contacts");
-    app.push_system("  /verify <name-or-hex>  upgrade a pending contact to verified (after comparing the SAS aloud)");
-    app.push_system("  /reject <name-or-hex>  mark a contact as rejected");
-    app.push_system("  /unpair <name-or-hex>  remove a contact entirely (use to start over)");
-    app.push_system("  /to <name-or-hex>    set the active contact; then just type to message them");
-    app.push_system("  /msg <name> <text>   send a one off message without changing the active contact");
-    app.push_system("  /connect <name-or-hex>  dial a verified contact (or a raw .onion address)");
-    app.push_system("  /passphrase          set a passphrase to enable the encrypted offline queue");
-    app.push_system("  /unlock              unlock the offline queue for this session");
-    app.push_system("  /clearqueue          discard all queued (undelivered) messages");
-    app.push_system("  /help, /?            show this");
-    app.push_system("  /quit, /q            exit");
-    app.push_system("keys:");
-    app.push_system("  Ctrl-C               quit");
-    app.push_system("  Esc                  clear the input line");
-    app.push_system("  Ctrl-L               show or hide the system log");
-    app.push_system("  Tab                  switch the pane the scroll keys drive");
-    app.push_system("  Enter                submit");
-    app.push_system("note: pick a contact with /to, then plain text you type is sent to them. messaging requires both sides verified. if a contact is offline, cord asks whether to queue the message (encrypted on disk; needs a passphrase via /passphrase); answer no to discard it.");
-}

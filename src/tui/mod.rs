@@ -45,6 +45,8 @@ pub struct App {
     pub vault_locked: bool,
     pub connected: HashSet<[u8; 32]>,
     pub show_log: bool,
+    pub show_help: bool,
+    pub log_unread: usize,
     pub focus: Pane,
     pub chat_view: PaneView,
     pub log_view: PaneView,
@@ -76,7 +78,6 @@ pub enum ChatEntry {
         text: String,
     },
     Outgoing {
-        to: String,
         text: String,
         id: u64,
         status: DeliveryStatus,
@@ -301,6 +302,8 @@ impl App {
             vault_locked: false,
             connected: HashSet::new(),
             show_log: false,
+            show_help: false,
+            log_unread: 0,
             focus: Pane::Conversation,
             chat_view: PaneView::new(),
             log_view: PaneView::new(),
@@ -450,22 +453,6 @@ impl App {
             .collect()
     }
 
-    pub fn list_contacts(&mut self) {
-        if self.contacts.is_empty() {
-            self.push_system("no contacts yet. use /pair <blob> to add one.");
-            return;
-        }
-        self.push_system(format!("contacts ({}):", self.contacts.len()));
-        let lines: Vec<String> = self
-            .contacts
-            .iter()
-            .map(|c| format!("  {}", c))
-            .collect();
-        for line in lines {
-            self.push_system(line);
-        }
-    }
-
     pub fn share_blob(&mut self, display_name: Option<String>) {
         let TransportState::Onion { hs_id, .. } = &self.transport_state else {
             self.push_system("/share: wait for Tor bootstrap to finish first.");
@@ -486,6 +473,9 @@ impl App {
             self.system_log.pop_front();
         }
         self.system_log.push_back(line.into());
+        if !self.show_log {
+            self.log_unread += 1;
+        }
     }
 
     pub fn push_incoming(&mut self, remote_static: [u8; 32], from: String, text: String) {
@@ -503,7 +493,6 @@ impl App {
     pub fn push_outgoing(
         &mut self,
         remote_static: [u8; 32],
-        to: String,
         text: String,
         id: u64,
         status: DeliveryStatus,
@@ -512,12 +501,7 @@ impl App {
             .conversations
             .entry(remote_static)
             .or_insert_with(Conversation::new);
-        convo.push(ChatEntry::Outgoing {
-            to,
-            text,
-            id,
-            status,
-        });
+        convo.push(ChatEntry::Outgoing { text, id, status });
     }
 
     pub fn apply(&mut self, msg: AppMsg) {
@@ -955,7 +939,7 @@ impl App {
                 self.push_system("send queue full");
                 return;
             }
-            self.push_outgoing(remote_static, label, text.to_string(), id, DeliveryStatus::Sending);
+            self.push_outgoing(remote_static, text.to_string(), id, DeliveryStatus::Sending);
         } else if self.vault_ready {
             // recipient offline but queueable: ask before queueing
             self.mode = InputMode::Confirm(ConfirmPrompt {
@@ -1084,7 +1068,7 @@ mod tests {
         let bob = [2u8; 32];
 
         app.push_incoming(alice, "alice".into(), "hi".into());
-        app.push_outgoing(alice, "alice".into(), "hey".into(), 10, DeliveryStatus::Sending);
+        app.push_outgoing(alice, "hey".into(), 10, DeliveryStatus::Sending);
         app.push_incoming(bob, "bob".into(), "yo".into());
 
         assert_eq!(app.conversations.len(), 2);
@@ -1198,7 +1182,7 @@ mod tests {
         let mut app = test_app();
         let alice = [1u8; 32];
 
-        app.push_outgoing(alice, "alice".into(), "hey".into(), 42, DeliveryStatus::Sending);
+        app.push_outgoing(alice, "hey".into(), 42, DeliveryStatus::Sending);
         app.update_delivery(42, DeliveryStatus::Delivered);
 
         match app.conversations[&alice].entries.back().unwrap() {
@@ -1207,6 +1191,47 @@ mod tests {
             }
             _ => panic!("expected outgoing entry"),
         }
+    }
+
+    fn type_and_enter(app: &mut App, text: &str, tx: &mpsc::Sender<TransportCmd>) {
+        app.input_buffer = text.to_string();
+        let key = Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        input::handle(app, key, tx);
+    }
+
+    #[test]
+    fn help_opens_a_panel_without_touching_the_log() {
+        let mut app = test_app();
+        let before = app.system_log.len();
+        let (tx, _rx) = mpsc::channel(8);
+
+        type_and_enter(&mut app, "/help", &tx);
+
+        assert!(app.show_help);
+        assert_eq!(app.system_log.len(), before, "help must not write to the log");
+    }
+
+    #[test]
+    fn esc_closes_the_help_panel() {
+        let mut app = test_app();
+        app.show_help = true;
+        let (tx, _rx) = mpsc::channel(8);
+
+        let key = Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
+        input::handle(&mut app, key, &tx);
+
+        assert!(!app.show_help);
+    }
+
+    #[test]
+    fn another_command_dismisses_help() {
+        let mut app = test_app();
+        app.show_help = true;
+        let (tx, _rx) = mpsc::channel(8);
+
+        type_and_enter(&mut app, "hello", &tx);
+
+        assert!(!app.show_help);
     }
 
     fn render_to_text(app: &mut App, w: u16, h: u16) -> String {
@@ -1270,17 +1295,30 @@ mod tests {
     }
 
     #[test]
-    fn hidden_log_drops_pane_and_shows_latest_line_in_status() {
+    fn hidden_log_drops_pane_and_shows_unread_count() {
         let mut app = test_app();
-        app.push_system("boomtoken");
-        app.show_log = false;
+        app.push_system("boomtoken"); // log hidden by default, so this is unread
 
         let text = render_to_text(&mut app, 120, 20);
         assert!(!text.contains("system log"), "log pane should be hidden:\n{text}");
         assert!(
-            text.contains("boomtoken"),
-            "latest system line should appear in the status bar:\n{text}"
+            text.contains("log 1"),
+            "status bar should show the unread log count:\n{text}"
         );
+    }
+
+    #[test]
+    fn system_messages_count_unread_until_log_is_shown() {
+        let mut app = test_app();
+        assert_eq!(app.log_unread, 0);
+
+        app.push_system("a");
+        app.push_system("b");
+        assert_eq!(app.log_unread, 2);
+
+        app.show_log = true;
+        let _ = render_to_text(&mut app, 80, 20); // rendering the log clears it
+        assert_eq!(app.log_unread, 0);
     }
 
     #[test]
