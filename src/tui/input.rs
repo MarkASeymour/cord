@@ -18,6 +18,8 @@ pub fn handle(
                 handle_confirm_key(app, key)
             } else if matches!(app.mode, InputMode::Sas(_)) {
                 handle_sas_key(app, key)
+            } else if matches!(app.mode, InputMode::ThemePicker(_)) {
+                handle_theme_picker_key(app, key)
             } else {
                 handle_key(app, key, cmd_tx)
             }
@@ -84,6 +86,23 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent) -> Option<TransportCmd> {
         }
         _ => None,
     }
+}
+
+fn handle_theme_picker_key(app: &mut App, key: KeyEvent) -> Option<TransportCmd> {
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+    {
+        app.should_quit = true;
+        return None;
+    }
+    match key.code {
+        KeyCode::Up | KeyCode::Char('k') => app.theme_picker_move(false),
+        KeyCode::Down | KeyCode::Char('j') => app.theme_picker_move(true),
+        KeyCode::Enter => app.theme_picker_apply(),
+        KeyCode::Esc => app.theme_picker_cancel(),
+        _ => {}
+    }
+    None
 }
 
 fn handle_sas_key(app: &mut App, key: KeyEvent) -> Option<TransportCmd> {
@@ -186,25 +205,63 @@ fn handle_key(
         app.toggle_log();
         return None;
     }
+    // readline style line editing, so Home/End/PgUp/PgDn stay on pane scroll
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        match key.code {
+            KeyCode::Char('a') | KeyCode::Char('A') => {
+                app.input.home();
+                return None;
+            }
+            KeyCode::Char('e') | KeyCode::Char('E') => {
+                app.input.end();
+                return None;
+            }
+            KeyCode::Char('w') | KeyCode::Char('W') => {
+                app.input.delete_word();
+                return None;
+            }
+            KeyCode::Char('u') | KeyCode::Char('U') => {
+                app.input.kill_to_start();
+                return None;
+            }
+            _ => {}
+        }
+    }
     match key.code {
         KeyCode::Esc => {
             // cancel: close the help panel if open, else clear the input; never quit
             if app.show_help {
                 app.show_help = false;
             } else {
-                app.input_buffer.clear();
+                app.input.clear();
             }
             None
         }
         KeyCode::Enter => submit(app, cmd_tx),
         KeyCode::Backspace => {
-            app.input_buffer.pop();
+            app.input.backspace();
             None
         }
         KeyCode::Char(c)
             if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
         {
-            app.input_buffer.push(c);
+            app.input.insert(c);
+            None
+        }
+        KeyCode::Left => {
+            app.input.left();
+            None
+        }
+        KeyCode::Right => {
+            app.input.right();
+            None
+        }
+        KeyCode::Up => {
+            app.history_prev();
+            None
+        }
+        KeyCode::Down => {
+            app.history_next();
             None
         }
         KeyCode::Tab => {
@@ -232,11 +289,12 @@ fn handle_key(
 }
 
 fn submit(app: &mut App, cmd_tx: &mpsc::Sender<TransportCmd>) -> Option<TransportCmd> {
-    let text = app.input_buffer.trim().to_string();
-    app.input_buffer.clear();
+    let text = app.input.text.trim().to_string();
+    app.input.clear();
     if text.is_empty() {
         return None;
     }
+    app.history_push(&text);
     if text == "/help" || text == "/?" {
         app.show_help = true;
         return None;
@@ -273,6 +331,19 @@ fn submit(app: &mut App, cmd_tx: &mpsc::Sender<TransportCmd>) -> Option<Transpor
             return None;
         }
         app.switch_to(q);
+        return None;
+    }
+    if text == "/theme" {
+        app.open_theme_picker();
+        return None;
+    }
+    if let Some(rest) = text.strip_prefix("/theme ") {
+        let name = rest.trim();
+        if name.is_empty() {
+            app.push_system("usage: /theme <name>");
+            return None;
+        }
+        app.set_theme(name);
         return None;
     }
     if let Some(rest) = text.strip_prefix("/verify ") {
