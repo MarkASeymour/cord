@@ -16,6 +16,10 @@ pub fn handle(
                 handle_passphrase_key(app, key)
             } else if matches!(app.mode, InputMode::Confirm(_)) {
                 handle_confirm_key(app, key)
+            } else if matches!(app.mode, InputMode::Sas(_)) {
+                handle_sas_key(app, key)
+            } else if matches!(app.mode, InputMode::ThemePicker(_)) {
+                handle_theme_picker_key(app, key)
             } else {
                 handle_key(app, key, cmd_tx)
             }
@@ -68,7 +72,7 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent) -> Option<TransportCmd> {
     match key.code {
         KeyCode::Char('y') | KeyCode::Char('Y') => {
             app.mode = InputMode::Normal;
-            app.push_outgoing(label, text.clone(), id, DeliveryStatus::Sending);
+            app.push_outgoing(remote_static, text.clone(), id, DeliveryStatus::Sending);
             Some(TransportCmd::SendMessage {
                 remote_static,
                 id,
@@ -78,6 +82,56 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent) -> Option<TransportCmd> {
         KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
             app.mode = InputMode::Normal;
             app.push_system(format!("discarded message to {label}"));
+            None
+        }
+        _ => None,
+    }
+}
+
+fn handle_theme_picker_key(app: &mut App, key: KeyEvent) -> Option<TransportCmd> {
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+    {
+        app.should_quit = true;
+        return None;
+    }
+    match key.code {
+        KeyCode::Up | KeyCode::Char('k') => app.theme_picker_move(false),
+        KeyCode::Down | KeyCode::Char('j') => app.theme_picker_move(true),
+        KeyCode::Enter => app.theme_picker_apply(),
+        KeyCode::Esc => app.theme_picker_cancel(),
+        _ => {}
+    }
+    None
+}
+
+fn handle_sas_key(app: &mut App, key: KeyEvent) -> Option<TransportCmd> {
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+    {
+        app.should_quit = true;
+        return None;
+    }
+    let remote_static = match &app.mode {
+        InputMode::Sas(p) => p.remote_static,
+        _ => return None,
+    };
+    match key.code {
+        KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+            app.mode = InputMode::Normal;
+            app.resolve_pairing(remote_static, true);
+            None
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') => {
+            app.mode = InputMode::Normal;
+            app.resolve_pairing(remote_static, false);
+            None
+        }
+        KeyCode::Esc => {
+            app.mode = InputMode::Normal;
+            app.push_system(
+                "pairing deferred; the contact stays pending. reconnect to compare the SAS again, or /verify or /reject by name.",
+            );
             None
         }
         _ => None,
@@ -145,20 +199,69 @@ fn handle_key(
         app.should_quit = true;
         return None;
     }
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('l') | KeyCode::Char('L'))
+    {
+        app.toggle_log();
+        return None;
+    }
+    // readline style line editing, so Home/End/PgUp/PgDn stay on pane scroll
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        match key.code {
+            KeyCode::Char('a') | KeyCode::Char('A') => {
+                app.input.home();
+                return None;
+            }
+            KeyCode::Char('e') | KeyCode::Char('E') => {
+                app.input.end();
+                return None;
+            }
+            KeyCode::Char('w') | KeyCode::Char('W') => {
+                app.input.delete_word();
+                return None;
+            }
+            KeyCode::Char('u') | KeyCode::Char('U') => {
+                app.input.kill_to_start();
+                return None;
+            }
+            _ => {}
+        }
+    }
     match key.code {
         KeyCode::Esc => {
-            app.should_quit = true;
+            // cancel: close the help panel if open, else clear the input; never quit
+            if app.show_help {
+                app.show_help = false;
+            } else {
+                app.input.clear();
+            }
             None
         }
         KeyCode::Enter => submit(app, cmd_tx),
         KeyCode::Backspace => {
-            app.input_buffer.pop();
+            app.input.backspace();
             None
         }
         KeyCode::Char(c)
             if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
         {
-            app.input_buffer.push(c);
+            app.input.insert(c);
+            None
+        }
+        KeyCode::Left => {
+            app.input.left();
+            None
+        }
+        KeyCode::Right => {
+            app.input.right();
+            None
+        }
+        KeyCode::Up => {
+            app.history_prev();
+            None
+        }
+        KeyCode::Down => {
+            app.history_next();
             None
         }
         KeyCode::Tab => {
@@ -186,15 +289,17 @@ fn handle_key(
 }
 
 fn submit(app: &mut App, cmd_tx: &mpsc::Sender<TransportCmd>) -> Option<TransportCmd> {
-    let text = app.input_buffer.trim().to_string();
-    app.input_buffer.clear();
+    let text = app.input.text.trim().to_string();
+    app.input.clear();
     if text.is_empty() {
         return None;
     }
+    app.history_push(&text);
     if text == "/help" || text == "/?" {
-        show_help(app);
+        app.show_help = true;
         return None;
     }
+    app.show_help = false; // any other action dismisses the commands panel
     if let Some(rest) = text.strip_prefix("/msg ") {
         let trimmed = rest.trim();
         match trimmed.split_once(char::is_whitespace) {
@@ -219,8 +324,26 @@ fn submit(app: &mut App, cmd_tx: &mpsc::Sender<TransportCmd>) -> Option<Transpor
         app.pair_with(trimmed);
         return None;
     }
-    if text == "/contacts" {
-        app.list_contacts();
+    if let Some(rest) = text.strip_prefix("/to ") {
+        let q = rest.trim();
+        if q.is_empty() {
+            app.push_system("usage: /to <name-or-hex>");
+            return None;
+        }
+        app.switch_to(q);
+        return None;
+    }
+    if text == "/theme" {
+        app.open_theme_picker();
+        return None;
+    }
+    if let Some(rest) = text.strip_prefix("/theme ") {
+        let name = rest.trim();
+        if name.is_empty() {
+            app.push_system("usage: /theme <name>");
+            return None;
+        }
+        app.set_theme(name);
         return None;
     }
     if let Some(rest) = text.strip_prefix("/verify ") {
@@ -251,10 +374,12 @@ fn submit(app: &mut App, cmd_tx: &mpsc::Sender<TransportCmd>) -> Option<Transpor
         return None;
     }
     if text == "/share" {
+        app.show_log = true; // the blob must be readable to copy
         app.share_blob(None);
         return None;
     }
     if let Some(rest) = text.strip_prefix("/share ") {
+        app.show_log = true; // the blob must be readable to copy
         let name = rest.trim();
         if name.is_empty() {
             app.share_blob(None);
@@ -302,27 +427,7 @@ fn submit(app: &mut App, cmd_tx: &mpsc::Sender<TransportCmd>) -> Option<Transpor
         app.push_system(format!("unknown command: {text}. type /help."));
         return None;
     }
-    app.push_system(format!("(echo) {text}"));
+    app.send_active(&text, cmd_tx);
     None
 }
 
-fn show_help(app: &mut App) {
-    app.push_system("commands:");
-    app.push_system("  /share [name]        print your own contact blob, optionally with a display name");
-    app.push_system("  /pair <blob>         add a peer's contact blob (status: pending)");
-    app.push_system("  /contacts            list paired contacts");
-    app.push_system("  /verify <name-or-hex>  upgrade a pending contact to verified (after comparing the SAS aloud)");
-    app.push_system("  /reject <name-or-hex>  mark a contact as rejected");
-    app.push_system("  /unpair <name-or-hex>  remove a contact entirely (use to start over)");
-    app.push_system("  /msg <name> <text>   send a text message to a verified contact");
-    app.push_system("  /connect <name-or-hex>  dial a verified contact (or a raw .onion address)");
-    app.push_system("  /passphrase          set a passphrase to enable the encrypted offline queue");
-    app.push_system("  /unlock              unlock the offline queue for this session");
-    app.push_system("  /clearqueue          discard all queued (undelivered) messages");
-    app.push_system("  /help, /?            show this");
-    app.push_system("  /quit, /q            exit");
-    app.push_system("keys:");
-    app.push_system("  Esc, Ctrl-C          exit");
-    app.push_system("  Enter                submit");
-    app.push_system("note: messaging requires both sides verified. if a contact is offline, cord asks whether to queue the message (encrypted on disk; needs a passphrase via /passphrase); answer no to discard it.");
-}
