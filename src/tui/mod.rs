@@ -177,6 +177,15 @@ pub enum InputMode {
     Normal,
     Passphrase(PassphrasePrompt),
     Confirm(ConfirmPrompt),
+    Sas(SasPrompt),
+}
+
+/// The pairing confirmation for a pending contact: shows the SAS to compare
+/// aloud and captures keys until the user verifies or rejects.
+pub struct SasPrompt {
+    pub label: String,
+    pub sas: String,
+    pub remote_static: [u8; 32],
 }
 
 /// A yes or no prompt asking whether to queue a message that could not be sent
@@ -291,7 +300,7 @@ impl App {
             vault_ready: false,
             vault_locked: false,
             connected: HashSet::new(),
-            show_log: true,
+            show_log: false,
             focus: Pane::Conversation,
             chat_view: PaneView::new(),
             log_view: PaneView::new(),
@@ -588,15 +597,18 @@ impl App {
                     // routine, an internal event only
                     Some((_, ContactStatus::Verified)) => {}
                     Some((label, ContactStatus::Pending)) => {
-                        self.push_system(format!(
-                            "handshake ok ({}): {}",
-                            role.label(),
-                            peer_id.short()
-                        ));
-                        self.push_system(format!("matches pending contact: {label}"));
-                        self.push_system(format!(
-                            "sas: {sas} (compare aloud, then /verify {label} or /reject {label})"
-                        ));
+                        // open the pairing modal, unless another modal is up
+                        if matches!(self.mode, InputMode::Normal) {
+                            self.mode = InputMode::Sas(SasPrompt {
+                                label,
+                                sas,
+                                remote_static,
+                            });
+                        } else {
+                            self.push_system(format!(
+                                "pending contact {label} connected. sas: {sas}. /verify or /reject when ready."
+                            ));
+                        }
                     }
                     Some((label, ContactStatus::Rejected)) => {
                         self.push_system(format!(
@@ -792,6 +804,36 @@ impl App {
         self.chat_view.to_bottom();
         if let Some(convo) = self.conversations.get_mut(&remote_static) {
             convo.unread = 0;
+        }
+    }
+
+    /// Resolve a pairing from the SAS modal: verify or reject the contact by its
+    /// Noise static key, persist, and resync routes. A verify also makes the
+    /// contact active so the user can start talking.
+    pub fn resolve_pairing(&mut self, remote_static: [u8; 32], verify: bool) {
+        let Some(i) = self
+            .contacts
+            .iter()
+            .position(|c| c.blob.noise_static_pub == remote_static)
+        else {
+            self.push_system("that contact no longer exists.");
+            return;
+        };
+        self.contacts[i].status = if verify {
+            ContactStatus::Verified
+        } else {
+            ContactStatus::Rejected
+        };
+        let label = self.contacts[i].short_label();
+        if let Err(e) = contacts::save(&self.identity.config_dir, &self.contacts) {
+            self.push_system(format!("contacts: save failed: {e}"));
+        }
+        self.contacts_dirty = true;
+        if verify {
+            self.set_active(remote_static);
+            self.push_system(format!("verified contact: {label}. now talking to them."));
+        } else {
+            self.push_system(format!("rejected contact: {label}."));
         }
     }
 
@@ -1216,7 +1258,7 @@ mod tests {
     #[test]
     fn toggle_log_flips_and_moves_focus_off_hidden_log() {
         let mut app = test_app();
-        assert!(app.show_log);
+        app.show_log = true;
         app.focus = Pane::SystemLog;
 
         app.toggle_log();
@@ -1257,11 +1299,111 @@ mod tests {
     #[test]
     fn ctrl_l_toggles_the_log() {
         let mut app = test_app();
+        let before = app.show_log;
         let (tx, _rx) = mpsc::channel(8);
 
         let key = Event::Key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL));
         input::handle(&mut app, key, &tx);
 
-        assert!(!app.show_log);
+        assert_eq!(app.show_log, !before);
+    }
+
+    #[test]
+    fn pending_handshake_opens_sas_modal() {
+        use crate::runtime::events::Role;
+        let mut app = test_app();
+        let alice = [1u8; 32];
+        app.contacts.push(contact(alice, "alice", ContactStatus::Pending));
+
+        app.apply(AppMsg::HandshakeOk {
+            peer_id: PeerId::generate(),
+            role: Role::Initiator,
+            sas: "123 456 789".into(),
+            remote_static: alice,
+        });
+
+        match &app.mode {
+            InputMode::Sas(p) => {
+                assert_eq!(p.remote_static, alice);
+                assert_eq!(p.sas, "123 456 789");
+            }
+            _ => panic!("expected the SAS modal to open"),
+        }
+    }
+
+    #[test]
+    fn verified_handshake_opens_no_modal() {
+        use crate::runtime::events::Role;
+        let mut app = test_app();
+        let alice = [1u8; 32];
+        app.contacts.push(contact(alice, "alice", ContactStatus::Verified));
+
+        app.apply(AppMsg::HandshakeOk {
+            peer_id: PeerId::generate(),
+            role: Role::Initiator,
+            sas: "123 456 789".into(),
+            remote_static: alice,
+        });
+
+        assert!(matches!(app.mode, InputMode::Normal));
+    }
+
+    #[test]
+    fn sas_modal_verify_sets_verified_and_active() {
+        let mut app = test_app();
+        let alice = [1u8; 32];
+        app.contacts.push(contact(alice, "alice", ContactStatus::Pending));
+        app.mode = InputMode::Sas(SasPrompt {
+            label: "alice".into(),
+            sas: "123".into(),
+            remote_static: alice,
+        });
+        let (tx, _rx) = mpsc::channel(8);
+
+        let key = Event::Key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::empty()));
+        input::handle(&mut app, key, &tx);
+
+        assert!(matches!(app.mode, InputMode::Normal));
+        assert_eq!(app.contacts[0].status, ContactStatus::Verified);
+        assert_eq!(app.active, Some(alice));
+        assert!(app.contacts_dirty);
+    }
+
+    #[test]
+    fn sas_modal_reject_sets_rejected_and_no_active() {
+        let mut app = test_app();
+        let alice = [1u8; 32];
+        app.contacts.push(contact(alice, "alice", ContactStatus::Pending));
+        app.mode = InputMode::Sas(SasPrompt {
+            label: "alice".into(),
+            sas: "123".into(),
+            remote_static: alice,
+        });
+        let (tx, _rx) = mpsc::channel(8);
+
+        let key = Event::Key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::empty()));
+        input::handle(&mut app, key, &tx);
+
+        assert_eq!(app.contacts[0].status, ContactStatus::Rejected);
+        assert_eq!(app.active, None);
+    }
+
+    #[test]
+    fn sas_modal_esc_defers_and_keeps_pending() {
+        let mut app = test_app();
+        let alice = [1u8; 32];
+        app.contacts.push(contact(alice, "alice", ContactStatus::Pending));
+        app.mode = InputMode::Sas(SasPrompt {
+            label: "alice".into(),
+            sas: "123".into(),
+            remote_static: alice,
+        });
+        let (tx, _rx) = mpsc::channel(8);
+
+        let key = Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
+        input::handle(&mut app, key, &tx);
+
+        assert!(matches!(app.mode, InputMode::Normal));
+        assert_eq!(app.contacts[0].status, ContactStatus::Pending);
     }
 }

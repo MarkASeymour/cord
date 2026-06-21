@@ -1,16 +1,18 @@
+use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::contacts::ContactStatus;
 use crate::runtime::events::DeliveryStatus;
 
-use super::{layout, App, ChatEntry, InputMode, Pane, TransportState};
+use super::{layout, App, ChatEntry, InputMode, Pane, SasPrompt, TransportState};
 
 const SHORT_ONION: usize = 16;
 
 pub fn render(frame: &mut Frame, app: &mut App) {
+    let area = frame.area();
     let layout::Regions {
         status,
         sidebar,
@@ -18,7 +20,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         log,
         input,
         footer,
-    } = layout::split(frame.area(), app.show_log);
+    } = layout::split(area, app.show_log);
 
     let mut status_spans = vec![
         Span::styled("cord ", Style::default().add_modifier(Modifier::BOLD)),
@@ -154,6 +156,15 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                 input,
             );
         }
+        InputMode::Sas(_) => {
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    "pairing: compare the SAS in the box, then y to verify or n to reject",
+                    Style::default().add_modifier(Modifier::DIM),
+                ))),
+                input,
+            );
+        }
         InputMode::Normal => {
             let input_line = if app.input_buffer.is_empty() {
                 Line::from(vec![
@@ -176,15 +187,60 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     ));
     frame.render_widget(Paragraph::new(footer_line), footer);
 
+    if let InputMode::Sas(p) = &app.mode {
+        render_sas_modal(frame, area, p);
+    }
+
     let cursor_col = match &app.mode {
         InputMode::Passphrase(p) => {
             p.title().chars().count() as u16 + 2 + p.buffer.chars().count() as u16
         }
         InputMode::Confirm(c) => c.question().chars().count() as u16,
+        InputMode::Sas(_) => 0,
         InputMode::Normal => 2 + app.input_buffer.chars().count() as u16,
     };
     let cursor_x = input.x + cursor_col;
     frame.set_cursor_position((cursor_x.min(input.x + input.width.saturating_sub(1)), input.y));
+}
+
+/// A centered popup for the pairing SAS comparison. Renders over the body so the
+/// decision cannot be ignored by accident.
+fn render_sas_modal(frame: &mut Frame, area: Rect, p: &SasPrompt) {
+    let w = 62.min(area.width.saturating_sub(4));
+    let h = 9.min(area.height.saturating_sub(2));
+    let popup = centered_rect(area, w, h);
+    frame.render_widget(Clear, popup);
+    let lines = vec![
+        Line::from(Span::styled(
+            format!("pair with {}", p.label),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from("compare this code aloud over a channel you both trust:"),
+        Line::from(Span::styled(
+            p.sas.clone(),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "y = verify (codes match)    n = reject    Esc = decide later",
+            Style::default().add_modifier(Modifier::DIM),
+        )),
+    ];
+    let block = Block::default().borders(Borders::ALL).title(" pairing ");
+    frame.render_widget(
+        Paragraph::new(lines).block(block).wrap(Wrap { trim: false }),
+        popup,
+    );
+}
+
+fn centered_rect(area: Rect, w: u16, h: u16) -> Rect {
+    Rect {
+        x: area.x + area.width.saturating_sub(w) / 2,
+        y: area.y + area.height.saturating_sub(h) / 2,
+        width: w,
+        height: h,
+    }
 }
 
 /// The maximum scroll offset for a wrapped paragraph: the row that puts the

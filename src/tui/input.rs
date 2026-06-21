@@ -16,6 +16,8 @@ pub fn handle(
                 handle_passphrase_key(app, key)
             } else if matches!(app.mode, InputMode::Confirm(_)) {
                 handle_confirm_key(app, key)
+            } else if matches!(app.mode, InputMode::Sas(_)) {
+                handle_sas_key(app, key)
             } else {
                 handle_key(app, key, cmd_tx)
             }
@@ -78,6 +80,39 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent) -> Option<TransportCmd> {
         KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
             app.mode = InputMode::Normal;
             app.push_system(format!("discarded message to {label}"));
+            None
+        }
+        _ => None,
+    }
+}
+
+fn handle_sas_key(app: &mut App, key: KeyEvent) -> Option<TransportCmd> {
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+    {
+        app.should_quit = true;
+        return None;
+    }
+    let remote_static = match &app.mode {
+        InputMode::Sas(p) => p.remote_static,
+        _ => return None,
+    };
+    match key.code {
+        KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+            app.mode = InputMode::Normal;
+            app.resolve_pairing(remote_static, true);
+            None
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') => {
+            app.mode = InputMode::Normal;
+            app.resolve_pairing(remote_static, false);
+            None
+        }
+        KeyCode::Esc => {
+            app.mode = InputMode::Normal;
+            app.push_system(
+                "pairing deferred; the contact stays pending. reconnect to compare the SAS again, or /verify or /reject by name.",
+            );
             None
         }
         _ => None,
@@ -199,6 +234,7 @@ fn submit(app: &mut App, cmd_tx: &mpsc::Sender<TransportCmd>) -> Option<Transpor
         return None;
     }
     if text == "/help" || text == "/?" {
+        app.show_log = true; // its output is meant to be read
         show_help(app);
         return None;
     }
@@ -227,6 +263,7 @@ fn submit(app: &mut App, cmd_tx: &mpsc::Sender<TransportCmd>) -> Option<Transpor
         return None;
     }
     if text == "/contacts" {
+        app.show_log = true;
         app.list_contacts();
         return None;
     }
@@ -267,10 +304,12 @@ fn submit(app: &mut App, cmd_tx: &mpsc::Sender<TransportCmd>) -> Option<Transpor
         return None;
     }
     if text == "/share" {
+        app.show_log = true; // the blob must be readable to copy
         app.share_blob(None);
         return None;
     }
     if let Some(rest) = text.strip_prefix("/share ") {
+        app.show_log = true; // the blob must be readable to copy
         let name = rest.trim();
         if name.is_empty() {
             app.share_blob(None);
